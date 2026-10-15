@@ -256,6 +256,34 @@ static int             s_all_func_count = 0;
 static const WsSite *s_ws_sites = NULL;
 /* game.toml exact_timing: cycle-exact emission (see emit_exact_insn_start). */
 static bool s_exact = false;
+/* Exact mode: the labelled instructions a computed JMP in the current function
+ * may land on (set per function before emission). */
+#define CASE_MAX 4096
+static uint32_t s_case[CASE_MAX];
+static int      s_case_count = 0;
+/* Exact mode: every disassembly-labelled instruction (extra_seeds) that is not
+ * a function entry is still enterable by computed control flow (jump tables,
+ * AI-script thunks, cross-function switch cases). Its host function is emitted
+ * as func_body_HOST(entry) with an entry switch, and func_LABEL(void) wrappers
+ * join the dispatch table. */
+typedef struct { uint32_t label, host; } LabelEntry;
+static LabelEntry *s_lbl = NULL;
+static int         s_lbl_count = 0, s_lbl_cap = 0;
+static void lbl_add(uint32_t label, uint32_t host)
+{
+    if (s_lbl_count == s_lbl_cap) {
+        s_lbl_cap = s_lbl_cap ? s_lbl_cap * 2 : 4096;
+        s_lbl = (LabelEntry *)realloc(s_lbl, (size_t)s_lbl_cap * sizeof *s_lbl);
+    }
+    s_lbl[s_lbl_count].label = label;
+    s_lbl[s_lbl_count].host  = host;
+    s_lbl_count++;
+}
+static int lbl_cmp(const void *a, const void *b)
+{
+    uint32_t x = ((const LabelEntry *)a)->label, y = ((const LabelEntry *)b)->label;
+    return x < y ? -1 : x > y;
+}
 static int           s_ws_site_count = 0;
 static const WsSite *ws_site_for(uint32_t addr) {
     for (int i = 0; i < s_ws_site_count; i++)
@@ -1504,8 +1532,11 @@ static void scan_function(const GenesisRom *rom, uint32_t start_addr,
                      * (d8,PC,Xn) JMP, try to discover Duff's-device or
                      * offset-table targets at the JMP base and seed them
                      * so the codegen probes find them in instrs. */
-                    seed_pc_idx_dispatch_targets(rom, &instr, &worklist,
-                                                 start_addr, sorted_funcs, nfuncs);
+                    /* Exact mode takes jump-table targets from the disassembly's
+                     * labels (extra_seeds) instead of guessing table shapes. */
+                    if (!s_exact)
+                        seed_pc_idx_dispatch_targets(rom, &instr, &worklist,
+                                                     start_addr, sorted_funcs, nfuncs);
                 }
                 goto next_work;
 
@@ -2703,6 +2734,25 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
                 emit_split_tail_call(f, "  ", instr->target_addr, *has_sp_adjust != 0,
                                      estimate_cycles(instr));
             }
+        } else if (s_exact && (mode == 2 || mode == 5 || mode == 6 ||
+                               (mode == 7 && reg <= 3))) {
+            /* Exact mode: any computed JMP. A target inside this function is one
+             * of its labelled instructions (switch cases, jump tables): goto it;
+             * anything else is dispatched as a tail call. */
+            audit_record(instr->addr, func_addr, 0,
+                         s_case_count ? JMPAUDIT_IN_FUNCTION_SWITCH : JMPAUDIT_DYNAMIC_REGISTER,
+                         s_case_count);
+            char ae[256];
+            emit_ea_addr_ex(f, instr, ea, &er, ae, true);
+            fprintf(f, "  { uint32_t _jt = (uint32_t)(%s) & 0xFFFFFFu;\n", ae);
+            if (s_case_count) {
+                fprintf(f, "    switch (_jt) {\n");
+                for (int c = 0; c < s_case_count; c++)
+                    fprintf(f, "    case 0x%06Xu: goto label_%06X;\n", s_case[c], s_case[c]);
+                fprintf(f, "    default: break;\n    }\n");
+            }
+            emit_split_tail_call_expr(f, "    ", "_jt", *has_sp_adjust != 0, -1);
+            fprintf(f, "  }\n");
         } else if (mode == 2 || mode == 5 || mode == 6 ||
                    (mode == 7 && (reg == 0 || reg == 1))) {
             audit_record(instr->addr, func_addr, 0,
@@ -5038,6 +5088,45 @@ bool codegen_emit(const GenesisRom *rom, const FunctionList *funcs,
             }
         }
 
+        /* Exact mode: a computed JMP inside this function may land on any of its
+         * disassembly-labelled instructions (extra_seeds: switch cases, jump-table
+         * targets). Label them all; the JMP emitter switches over this set. */
+        s_case_count = 0;
+        if (s_exact && cfg && cfg->extra_seed_count) {
+            bool computed = false;
+            for (int j = 0; j < instrs.count && !computed; j++) {
+                M68KInstr probe;
+                if (m68k_decode(rom, instrs.addrs[j], &probe) && probe.mnemonic == MN_JMP &&
+                    !probe.has_target)
+                    computed = true;
+            }
+            if (computed) {
+                for (int s = 0; s < cfg->extra_seed_count; s++) {
+                    uint32_t a = cfg->extra_seeds[s];
+                    if (addrset_contains(&instrs, a) && s_case_count < CASE_MAX) {
+                        s_case[s_case_count++] = a;
+                        addrset_insert(&labels, a);
+                    }
+                }
+            }
+        }
+
+        /* Exact mode: this function's enterable interior labels. */
+        int lbl_first = s_lbl_count;
+        if (s_exact && !has_aliases && cfg && cfg->extra_seed_count) {
+            for (int s = 0; s < cfg->extra_seed_count; s++) {
+                uint32_t a = cfg->extra_seeds[s];
+                if (a != func_addr && addrset_contains(&instrs, a) &&
+                    !addr_is_function_entry(a, all_funcs.addrs, all_funcs.count)) {
+                    bool dup = false;
+                    for (int k = lbl_first; k < s_lbl_count; k++)
+                        if (s_lbl[k].label == a) { dup = true; break; }
+                    if (!dup) { lbl_add(a, func_addr); addrset_insert(&labels, a); }
+                }
+            }
+        }
+        bool lbl_entries = s_lbl_count > lbl_first;
+
         /* Every alias wrapper enters this shared body through a label at its
          * exact instruction address. The canonical body is emitted once. */
         if (has_aliases) {
@@ -5061,6 +5150,8 @@ bool codegen_emit(const GenesisRom *rom, const FunctionList *funcs,
              * constraint. */
             fprintf(f_func, "void func_body_%06X(uint32_t _entry) {\n",
                     func_addr);
+        else if (lbl_entries)
+            fprintf(f_func, "static void func_body_%06X(uint32_t _entry) {\n", func_addr);
         else
             fprintf(f_func, "void func_%06X(void) {\n", func_addr);
         if (s_reverse_debug) {
@@ -5191,6 +5282,12 @@ bool codegen_emit(const GenesisRom *rom, const FunctionList *funcs,
             continue;
         }
 
+        if (lbl_entries) {
+            fprintf(f_func, "  switch (_entry) {\n");
+            for (int k = lbl_first; k < s_lbl_count; k++)
+                fprintf(f_func, "    case 0x%06Xu: goto label_%06X;\n", s_lbl[k].label, s_lbl[k].label);
+            fprintf(f_func, "    default: break;\n  }\n");
+        }
         if (has_aliases) {
             fprintf(f_func, "  switch (_entry) {\n");
             for (int a = 0; a < all_funcs.count; a++) {
@@ -5367,6 +5464,16 @@ bool codegen_emit(const GenesisRom *rom, const FunctionList *funcs,
 
         fprintf(f_func, "}\n\n");
 
+        if (lbl_entries) {
+            /* The function itself and each enterable label share the body. */
+            fprintf(f_func, "void func_%06X(void) { func_body_%06X(0x%06Xu); }\n",
+                    func_addr, func_addr, func_addr);
+            for (int k = lbl_first; k < s_lbl_count; k++)
+                fprintf(f_func, "void func_%06X(void) { func_body_%06X(0x%06Xu); }\n",
+                        s_lbl[k].label, func_addr, s_lbl[k].label);
+            fprintf(f_func, "\n");
+        }
+
         if (has_aliases) {
             /* Thin dispatchable wrappers preserve every original entry while
              * sharing one host CFG/body. No wrapper changes the host extent. */
@@ -5440,11 +5547,22 @@ bool codegen_emit(const GenesisRom *rom, const FunctionList *funcs,
     /* Forward-declare all functions */
     for (int i = 0; i < all_funcs.count; i++)
         fprintf(f_dispatch, "void func_%06X(void);\n", all_funcs.addrs[i]);
+    /* Exact mode: label entries (func_LABEL wrappers), merged in address order. */
+    if (s_lbl_count)
+        qsort(s_lbl, (size_t)s_lbl_count, sizeof *s_lbl, lbl_cmp);
+    for (int k = 0; k < s_lbl_count; k++)
+        fprintf(f_dispatch, "void func_%06X(void);\n", s_lbl[k].label);
 
     fprintf(f_dispatch, "\nstatic const DispatchEntry s_dispatch_table[] = {\n");
-    for (int i = 0; i < all_funcs.count; i++)
-        fprintf(f_dispatch, "    { 0x%06Xu, func_%06X },\n",
-                all_funcs.addrs[i], all_funcs.addrs[i]);
+    int dispatch_count = 0;
+    for (int i = 0, k = 0; i < all_funcs.count || k < s_lbl_count; dispatch_count++) {
+        uint32_t a;
+        if (k >= s_lbl_count || (i < all_funcs.count && all_funcs.addrs[i] < s_lbl[k].label))
+            a = all_funcs.addrs[i++];
+        else
+            a = s_lbl[k++].label;
+        fprintf(f_dispatch, "    { 0x%06Xu, func_%06X },\n", a, a);
+    }
     fprintf(f_dispatch, "    { 0u, NULL }\n};\n\n");
 
     fprintf(f_dispatch,
@@ -5458,14 +5576,14 @@ bool codegen_emit(const GenesisRom *rom, const FunctionList *funcs,
         "    return (lo < %d && s_dispatch_table[lo].addr == addr)\n"
         "         ? s_dispatch_table[lo].fn : NULL;\n"
         "}\n\n",
-        all_funcs.count, all_funcs.count);
+        dispatch_count, dispatch_count);
 
     /* Table accessors for interior-label detection in genesis_log_dispatch_miss */
-    fprintf(f_dispatch, "int game_dispatch_table_size(void) { return %d; }\n", all_funcs.count);
+    fprintf(f_dispatch, "int game_dispatch_table_size(void) { return %d; }\n", dispatch_count);
     fprintf(f_dispatch,
         "uint32_t game_dispatch_table_addr(int i) {\n"
         "    return (i >= 0 && i < %d) ? s_dispatch_table[i].addr : 0;\n"
-        "}\n\n", all_funcs.count);
+        "}\n\n", dispatch_count);
 
     /* game_hook sites, sorted, so the tier-3 interpreter can run the same
      * genesis_game_instruction_hook() callbacks as the generated code. */
