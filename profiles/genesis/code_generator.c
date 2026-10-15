@@ -254,6 +254,8 @@ static int             s_all_func_count = 0;
  * TOML. This is the post-patch widening layer: the ROM is recompiled
  * unmodified and the widening lives entirely in the emitted C. */
 static const WsSite *s_ws_sites = NULL;
+/* game.toml exact_timing: cycle-exact emission (see emit_exact_insn_start). */
+static bool s_exact = false;
 static int           s_ws_site_count = 0;
 static const WsSite *ws_site_for(uint32_t addr) {
     for (int i = 0; i < s_ws_site_count; i++)
@@ -1028,7 +1030,9 @@ static const char *bcc_cond_expr(int cond) {
 
 static void emit_cycle_accounting(FILE *f, const char *indent, int cycles)
 {
-    if (cycles < 0)
+    /* Exact mode charges every instruction up front in XI() (and data-dependent
+     * extras inline), so the trailing accounting must not double-count. */
+    if (cycles < 0 || s_exact)
         return;
     fprintf(f, "%sg_native_insn_count++; g_cycle_accumulator += %d;"
                " g_audio_cycle_counter += %d;"
@@ -2193,11 +2197,63 @@ static FILE *cycle_diag_file(void)
     return g_cycle_diag_f;
 }
 
+/* Exact mode: the instruction's cost before any data-dependent part, matching
+ * the reference emulator the exact runtime is verified against (Genesis Plus GX,
+ * whose 68000 core uses Musashi's timing). Where that differs from the PRM model
+ * above, Musashi's value wins, because frame-identical equivalence with the
+ * reference is the contract:
+ *   - Bcc 10 / DBcc 12 / Scc Dn 4 (ST 6): taken / cc-true / false base; the
+ *     untaken, loop-exit and true-set deltas are emitted inline.
+ *   - register-count shifts and rotates: the 6/8 base; 2 per bit is inline.
+ *   - MULU/MULS/DIVU/DIVS: operand fetch only; the operand-dependent time is
+ *     computed at run time (x68k_mul*_cycles / x68k_div*_cycles).
+ *   - ADDQ.W #,An 4, ANDI.L #,Dn 14, BSET/BCHG/BCLR on Dn without the
+ *     bit-number < 16 discount (static 12/12/14, dynamic 8/8/10).
+ * Verified opcode by opcode with XMen2Recomp tools/cycle_census.py. */
+static int estimate_cycles_exact(const M68KInstr *instr)
+{
+    M68KSize sz  = instr->size;
+    int is_long  = (sz == M68K_SIZE_L);
+    int op_is_reg = ea_is_reg(instr->src_ea);
+    uint16_t w0  = instr->words[0];
+    switch (instr->mnemonic) {
+    case MN_Bcc:  return 10;
+    case MN_DBcc: return 12;
+    case MN_Scc:
+        if (op_is_reg) return ((w0 >> 8) & 0xF) == 0 ? 6 : 4;
+        break;
+    case MN_LSL: case MN_LSR: case MN_ASL: case MN_ASR:
+    case MN_ROL: case MN_ROR: case MN_ROXL: case MN_ROXR:
+        if (!instr->mem_shift && ((w0 >> 5) & 1))
+            return is_long ? 8 : 6;
+        break;
+    case MN_MULU: case MN_MULS: case MN_DIVU: case MN_DIVS:
+        return ea_calc_cost(instr->src_ea, M68K_SIZE_W);
+    case MN_ADDQ:
+        if (((instr->src_ea >> 3) & 7) == 1 && ((w0 >> 6) & 3) == 1) return 4;   /* .W #,An */
+        break;
+    case MN_ANDI:
+        if (op_is_reg && is_long) return 14;
+        break;
+    case MN_BSET: case MN_BCHG: case MN_BCLR:
+        if (op_is_reg) {
+            int dynamic = (w0 >> 8) & 1;
+            int is_bclr = (instr->mnemonic == MN_BCLR);
+            if (dynamic) return is_bclr ? 10 : 8;
+            return is_bclr ? 14 : 12;
+        }
+        break;
+    default:
+        break;
+    }
+    return estimate_cycles_prm(instr);
+}
+
 /* Sole cycle-cost entry point. The clean-room model IS the cost, so codegen is
  * deterministic and reproducible from the ROM and config alone. */
 static int estimate_cycles(const M68KInstr *instr)
 {
-    int cost = estimate_cycles_prm(instr);
+    int cost = s_exact ? estimate_cycles_exact(instr) : estimate_cycles_prm(instr);
 
     FILE *diag = cycle_diag_file();
     if (diag) {
@@ -2344,6 +2400,14 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
 
     /* ------------------------------------------------------------------ */
     case MN_RTS:
+        if (s_exact) {
+            /* Hardware RTS: pop the return target; call sites compare it (see
+             * the exact JSR emission) and unwind until it matches. */
+            fprintf(f, "  g_xrts = m68k_read32(g_cpu.A[7]) & 0xFFFFFFu; g_cpu.A[7] += 4;\n");
+            fprintf(f, "  return;\n");
+            *skip_until_label = true;
+            break;
+        }
         /* A stack skip can discard MORE than one return slot (SMPS's
          * stop-track command uses addq.w #8,sp). Carry the complete count
          * through the C callers; a boolean loses the second unwind and
@@ -2377,6 +2441,7 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
          * need to be reinstated as the sole SR restore mechanism. */
         fprintf(f, "  g_cpu.SR = (uint16_t)m68k_read16(g_cpu.A[7]); g_cpu.A[7] += 2; /* RTE: pop SR */\n");
         fprintf(f, "  g_cpu.PC = m68k_read32(g_cpu.A[7]);            g_cpu.A[7] += 4; /* RTE: pop PC */\n");
+        if (s_exact) fprintf(f, "  XSR();\n");
         emit_cycle_accounting(f, "  ", estimate_cycles(instr));
         fprintf(f, "  g_rte_pending = 1; return; /* RTE */\n");
         *skip_until_label = true;
@@ -2495,6 +2560,40 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
          * object's restored code pointer, not by linear fall-through). Without
          * this the recompiled caller runs ret_addr a frame early, corrupting
          * the object's state machine (e.g. the AIZ MonkeyDude body). */
+        if (s_exact) {
+            /* Exact mode: hardware call/return. The JSR pushes the return address;
+             * the callee's RTS pops whatever is on top of the stack into g_xrts and
+             * returns from C. This call site continues only if the 68000 came back
+             * here; otherwise the RTS went further out (a callee that discarded or
+             * captured our return address, or skipped its caller) and the C frame
+             * unwinds until the call site it did return to. No stack-slot
+             * bookkeeping: the 68000 stack is the truth. An RTE in an interrupt
+             * handler unwinds the same way via g_rte_pending. */
+            fprintf(f, "  recomp_push_return(0x%06Xu); /* JSR push */\n", ret_addr);
+            if (instr->has_target) {
+                if (func_is_known(bsr_target))
+                    fprintf(f, "  recomp_call_func(func_%06X);\n", bsr_target);
+                else
+                    fprintf(f, "  recomp_call_addr(0x%06Xu); /* JSR target not in func table */\n",
+                            bsr_target);
+            } else if (mode == 2 || mode == 5 || mode == 6 || (mode == 7 && reg <= 3)) {
+                char ae[256];
+                emit_ea_addr_ex(f, instr, ea, &er, ae, true);
+                fprintf(f, "  recomp_call_addr(%s);\n", ae);
+            } else {
+                codegen_diag_record(CGD_TODO_DYNAMIC_JSR_UNSUPPORTED, addr,
+                                    instr->words[0], instr->mnemonic, func_name, func_addr);
+                fprintf(f, "  /* TODO: dynamic JSR/BSR EA %d/%d */\n", mode, reg);
+            }
+            fprintf(f, "  if (g_rte_pending || g_xrts != 0x%06Xu) return; /* returned further out */\n",
+                    ret_addr);
+            if (!addrset_contains(instrs, ret_addr)) {
+                /* Discovery made the continuation its own function. */
+                emit_split_tail_call(f, "  ", ret_addr, false, -1);
+                *skip_until_label = true;
+            }
+            break;
+        }
         if (instr->has_target &&
             function_finder_pops_return_unconditionally(rom, instr->target_addr)) {
             fprintf(f, "  recomp_push_return(0x%06Xu); /* JSR push (callee captures return) */\n",
@@ -2819,6 +2918,8 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
                                 func_name, func_addr);
             fprintf(f, "  /* Bcc no target */\n");
         }
+        if (s_exact)   /* not taken: Bcc.S 8, Bcc.W 12 (base 10 charged in XI) */
+            fprintf(f, "  XC(%d);\n", instr->byte_length == 2 ? -14 : 14);
         break;
     }
 
@@ -2833,6 +2934,8 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
         fprintf(f, "    g_cpu.D[%d] = (g_cpu.D[%d] & 0xFFFF0000u) | (uint32_t)((uint16_t)((uint16_t)(g_cpu.D[%d]) - 1u));\n",
                 dreg, dreg, dreg);
         fprintf(f, "    if ((int16_t)g_cpu.D[%d] != -1) {\n", dreg);
+        if (s_exact)
+            fprintf(f, "      XC(-14); /* loop: 10 */\n");
         if (instr->has_target) {
             if (addrset_contains(instrs, instr->target_addr)) {
                 emit_cycle_accounting(f, "      ", estimate_cycles(instr));
@@ -2842,7 +2945,10 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
                                      estimate_cycles(instr));
             }
         }
-        fprintf(f, "    }\n  }\n");
+        fprintf(f, "    }\n");
+        if (s_exact)
+            fprintf(f, "    XC(14); /* counter expired: 14 */\n");
+        fprintf(f, "  }\n");
         break;
     }
 
@@ -3149,6 +3255,7 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
     case MN_ORI_TO_SR:
         fprintf(f, "  g_cpu.SR |= 0x%04Xu; /* ORI #imm,SR */\n",
                 (unsigned)(instr->imm32 & 0xFFFFu));
+        if (s_exact) fprintf(f, "  XSR();\n");
         break;
     case MN_ANDI_TO_CCR:
         fprintf(f, "  g_cpu.SR &= 0x%04Xu; /* ANDI #imm,CCR */\n",
@@ -3157,6 +3264,7 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
     case MN_ANDI_TO_SR:
         fprintf(f, "  g_cpu.SR &= 0x%04Xu; /* ANDI #imm,SR */\n",
                 (unsigned)(instr->imm32 & 0xFFFFu));
+        if (s_exact) fprintf(f, "  XSR();\n");
         break;
     case MN_EORI_TO_CCR:
         fprintf(f, "  g_cpu.SR ^= 0x%02Xu; /* EORI #imm,CCR */\n",
@@ -3165,6 +3273,7 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
     case MN_EORI_TO_SR:
         fprintf(f, "  g_cpu.SR ^= 0x%04Xu; /* EORI #imm,SR */\n",
                 (unsigned)(instr->imm32 & 0xFFFFu));
+        if (s_exact) fprintf(f, "  XSR();\n");
         break;
 
     /* ------------------------------------------------------------------ */
@@ -3402,6 +3511,10 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
     case MN_LSL:
     case MN_LSR: {
         if (instr->mem_shift) { emit_mem_shift(f, instr, addr, &er); break; }
+        if (s_exact && instr->src_ea >= 0)   /* count register: 2 per bit, mod 64 */
+            fprintf(f, "  XC(14u * (g_cpu.D[%d] & 63u));\n", instr->src_ea);
+        else if (s_exact && !instr->mem_shift && ((instr->words[0] >> 5) & 1))
+            fprintf(f, "  XC(14u * (g_cpu.D[%d] & 63u));\n", (instr->words[0] >> 9) & 7);
         int dreg  = instr->reg;
         bool left = (instr->mnemonic == MN_LSL);
         bool reg_count = (instr->src_ea >= 0);
@@ -3464,6 +3577,10 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
     case MN_ASL:
     case MN_ASR: {
         if (instr->mem_shift) { emit_mem_shift(f, instr, addr, &er); break; }
+        if (s_exact && instr->src_ea >= 0)   /* count register: 2 per bit, mod 64 */
+            fprintf(f, "  XC(14u * (g_cpu.D[%d] & 63u));\n", instr->src_ea);
+        else if (s_exact && !instr->mem_shift && ((instr->words[0] >> 5) & 1))
+            fprintf(f, "  XC(14u * (g_cpu.D[%d] & 63u));\n", (instr->words[0] >> 9) & 7);
         int dreg  = instr->reg;
         bool asr_reg_count = (instr->src_ea >= 0);
         int count = asr_reg_count ? 0 : (int)(instr->imm32 & 63);
@@ -3553,6 +3670,10 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
     case MN_ROL:
     case MN_ROR: {
         if (instr->mem_shift) { emit_mem_shift(f, instr, addr, &er); break; }
+        if (s_exact && instr->src_ea >= 0)   /* count register: 2 per bit, mod 64 */
+            fprintf(f, "  XC(14u * (g_cpu.D[%d] & 63u));\n", instr->src_ea);
+        else if (s_exact && !instr->mem_shift && ((instr->words[0] >> 5) & 1))
+            fprintf(f, "  XC(14u * (g_cpu.D[%d] & 63u));\n", (instr->words[0] >> 9) & 7);
         int dreg  = instr->reg;
         bool rot_reg_count = (instr->src_ea >= 0);
         int count = rot_reg_count ? 0 : (int)(instr->imm32 & 63);
@@ -3611,6 +3732,10 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
     case MN_ROXL:
     case MN_ROXR: {
         if (instr->mem_shift) { emit_mem_shift(f, instr, addr, &er); break; }
+        if (s_exact && instr->src_ea >= 0)   /* count register: 2 per bit, mod 64 */
+            fprintf(f, "  XC(14u * (g_cpu.D[%d] & 63u));\n", instr->src_ea);
+        else if (s_exact && !instr->mem_shift && ((instr->words[0] >> 5) & 1))
+            fprintf(f, "  XC(14u * (g_cpu.D[%d] & 63u));\n", (instr->words[0] >> 9) & 7);
         int dreg  = instr->reg;
         int count = (int)(instr->imm32 & 63);
         bool left = (instr->mnemonic == MN_ROXL);
@@ -3653,6 +3778,8 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
     case MN_MULU: {
         int dreg = instr->reg;
         emit_ea_load(f, instr, instr->src_ea, M68K_SIZE_W, &er, tmp, src_expr);
+        if (s_exact)
+            fprintf(f, "  XC(x68k_mulu_mclk((uint16_t)(%s)));\n", src_expr);
         fprintf(f,
             "  g_cpu.D[%d] = (uint32_t)(uint16_t)g_cpu.D[%d] * (uint32_t)(uint16_t)(%s);\n",
             dreg, dreg, src_expr);
@@ -3666,6 +3793,8 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
     case MN_MULS: {
         int dreg = instr->reg;
         emit_ea_load(f, instr, instr->src_ea, M68K_SIZE_W, &er, tmp, src_expr);
+        if (s_exact)
+            fprintf(f, "  XC(x68k_muls_mclk((int16_t)(%s)));\n", src_expr);
         fprintf(f,
             "  g_cpu.D[%d] = (uint32_t)((int32_t)(int16_t)g_cpu.D[%d] * (int32_t)(int16_t)(%s));\n",
             dreg, dreg, src_expr);
@@ -3681,6 +3810,25 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
         char tmp2[32];
         snprintf(tmp2, sizeof(tmp2), "_tv%06X", addr);
         emit_ea_load(f, instr, instr->src_ea, M68K_SIZE_W, &er, tmp2, src_expr);
+        if (s_exact) {
+            /* Reference (Musashi/GPGX) semantics: overflow sets V and N, clears
+             * C, leaves Z and Dn; time is operand-dependent (x68k_divu_mclk) or
+             * 10 cycles on overflow. Divide by zero traps (vector 5). */
+            fprintf(f,
+                "  { uint32_t _dv = (uint16_t)(%s); uint32_t _dest = g_cpu.D[%d];\n"
+                "    if (_dv == 0u) { g_cpu.SR &= ~(1u<<0); x68k_divide_by_zero(0x%06Xu); }\n"
+                "    else { uint32_t _quo = _dest / _dv, _rem = _dest %% _dv;\n"
+                "      if (_quo < 0x10000u) {\n"
+                "        XC(x68k_divu_mclk(_dest, _dv));\n"
+                "        g_cpu.D[%d] = (_quo & 0xFFFFu) | ((_rem & 0xFFFFu) << 16);\n"
+                "        g_cpu.SR &= ~((1u<<3)|(1u<<2)|(1u<<1)|(1u<<0));\n"
+                "        if (_quo & 0x8000u) g_cpu.SR |= (1u<<3);\n"
+                "        if ((_quo & 0xFFFFu) == 0u) g_cpu.SR |= (1u<<2);\n"
+                "      } else { XC(70); g_cpu.SR |= (1u<<1)|(1u<<3); g_cpu.SR &= ~(1u<<0); }\n"
+                "    }\n  }\n",
+                src_expr, dreg, instr->addr + instr->byte_length, dreg);
+            break;
+        }
         /* HW-accurate (matches clown68000 / the Tier-3 floor): on quotient
          * overflow set V+N, clear Z, leave Dn UNCHANGED. C always cleared.
          * On real inputs this is identical to a plain divide (no overflow). */
@@ -3706,6 +3854,28 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
         char tmp2[32];
         snprintf(tmp2, sizeof(tmp2), "_tv%06X", addr);
         emit_ea_load(f, instr, instr->src_ea, M68K_SIZE_W, &er, tmp2, src_expr);
+        if (s_exact) {
+            /* Reference (Musashi/GPGX) semantics: time charged before the
+             * overflow test; $80000000 / -1 gives 0 with Z set; overflow sets V
+             * and N, clears C, leaves Z and Dn. */
+            fprintf(f,
+                "  { int32_t _dv = (int16_t)(%s); int32_t _dest = (int32_t)g_cpu.D[%d];\n"
+                "    if (_dv == 0) { g_cpu.SR &= ~(1u<<0); x68k_divide_by_zero(0x%06Xu); }\n"
+                "    else { XC(x68k_divs_mclk(_dest, (int16_t)_dv));\n"
+                "      if ((uint32_t)_dest == 0x80000000u && _dv == -1) {\n"
+                "        g_cpu.D[%d] = 0u; g_cpu.SR = (uint16_t)((g_cpu.SR & ~0x0Fu) | (1u<<2));\n"
+                "      } else { int32_t _quo = _dest / _dv, _rem = _dest %% _dv;\n"
+                "        if (_quo == (int16_t)_quo) {\n"
+                "          g_cpu.D[%d] = ((uint32_t)_quo & 0xFFFFu) | (((uint32_t)_rem & 0xFFFFu) << 16);\n"
+                "          g_cpu.SR &= ~((1u<<3)|(1u<<2)|(1u<<1)|(1u<<0));\n"
+                "          if (_quo & 0x8000) g_cpu.SR |= (1u<<3);\n"
+                "          if ((_quo & 0xFFFF) == 0) g_cpu.SR |= (1u<<2);\n"
+                "        } else { g_cpu.SR |= (1u<<1)|(1u<<3); g_cpu.SR &= ~(1u<<0); }\n"
+                "      }\n"
+                "    }\n  }\n",
+                src_expr, dreg, instr->addr + instr->byte_length, dreg, dreg);
+            break;
+        }
         /* HW-accurate signed divide (matches clown68000 / the Tier-3 floor):
          * absolute-value method + unsigned and signed overflow checks; on
          * overflow set V+N, clear Z, leave Dn unchanged. C always cleared. */
@@ -3950,6 +4120,7 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
             /* Mask to the valid 68000 SR bits (T,S,I2-0,X,N,Z,V,C = 0xA71F) —
              * unused bits read as 0 on hardware. */
             fprintf(f, "  g_cpu.SR = (uint16_t)((%s) & 0xA71Fu);\n", src_expr);
+            if (s_exact) fprintf(f, "  XSR();\n");
         } else {
             emit_ea_store(f, instr, instr->src_ea, M68K_SIZE_W, &er, "g_cpu.SR");
         }
@@ -3996,6 +4167,8 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
         ExtReader er_save = er;
         /* Write 0xFF or 0x00 */
         fprintf(f, "  { uint8_t _sval = (%s) ? 0xFFu : 0x00u;\n", ce);
+        if (s_exact && ea_is_reg(instr->src_ea) && cond > 1)
+            fprintf(f, "    if (_sval) XC(14); /* Scc Dn true: 6 */\n");
         emit_ea_store(f, instr, instr->src_ea, M68K_SIZE_B, &er_save, "_sval");
         fprintf(f, "  }\n");
         break;
@@ -4560,6 +4733,7 @@ bool codegen_emit(const GenesisRom *rom, const FunctionList *funcs,
     s_extra_seeds      = cfg ? cfg->extra_seeds      : NULL;
     s_extra_seed_count = cfg ? cfg->extra_seed_count : 0;
     s_ws_sites      = cfg ? cfg->ws_sites      : NULL;
+    s_exact         = cfg ? cfg->exact_timing  : false;
     s_ws_site_count = cfg ? cfg->ws_site_count : 0;
     if (s_ws_site_count)
         printf("[Codegen] [widescreen] %d injection sites armed (recompile-time)\n",
@@ -4978,10 +5152,10 @@ bool codegen_emit(const GenesisRom *rom, const FunctionList *funcs,
          *      func_003384, and (by inspection) virtually every other
          *      Genesis disasm port. Detecting the shape statically means
          *      we don't need a per-game cfg directive for any future port. */
-        bool yield_via_cfg = (!has_aliases && cfg->vblank_yield_addr &&
+        bool yield_via_cfg = (!s_exact && !has_aliases && cfg->vblank_yield_addr &&
                               func_addr == cfg->vblank_yield_addr);
         bool yield_via_pattern = false;
-        if (!has_aliases && !yield_via_cfg && instrs.count == 4) {
+        if (!s_exact && !has_aliases && !yield_via_cfg && instrs.count == 4) {
             M68KInstr di[4];
             bool ok = true;
             for (int k = 0; k < 4 && ok; k++) {
@@ -5075,7 +5249,7 @@ bool codegen_emit(const GenesisRom *rom, const FunctionList *funcs,
              *   Sonic 2 BuildSprites_P2 ($016A7A):
              *       tst.w (Hint_flag).w
              *       bne.s BuildSprites_P2 */
-            if (j + 1 < instrs.count && instr.mnemonic == MN_TST) {
+            if (!s_exact && j + 1 < instrs.count && instr.mnemonic == MN_TST) {
                 M68KInstr next;
                 if (m68k_decode(rom, instrs.addrs[j + 1], &next) &&
                     next.mnemonic == MN_Bcc &&
@@ -5084,6 +5258,12 @@ bool codegen_emit(const GenesisRom *rom, const FunctionList *funcs,
                     g_yield_in_next_bne = true;
                 }
             }
+
+            /* Exact mode: every instruction starts at a boundary where the
+             * scheduler may end the time slice or take an interrupt (pc is the
+             * address an interrupt pushes), then charges its exact cost. */
+            if (s_exact)
+                fprintf(f_func, "  XI(0x%06Xu, %du);\n", pc, 7u * (unsigned)estimate_cycles(&instr));
 
             /* Push-then-RTS: `move.l <ea>,-(sp)` or `pea <ea>` falling straight
              * into an RTS that no branch targets is a computed jump to the pushed
