@@ -3433,8 +3433,11 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
          * silently zeroing the X flag set by the earlier subi.b in
          * PSGSetFreq — corrupting downstream Bcc paths that read X
          * (squelched notes, drift). */
+        /* A plain store (rmw 0): no load ran, so -(An)/(An)+ must adjust An
+         * here. The read-modify-write form skipped that and left `clr.l -(sp)`
+         * writing over the stack top without pushing. */
         ExtReader er2; er_init(&er2, instr);
-        emit_ea_store_ex(f, instr, instr->src_ea, sz, &er2, "0", 1);
+        emit_ea_store_ex(f, instr, instr->src_ea, sz, &er2, "0", 0);
         fprintf(f, "  g_cpu.SR = (g_cpu.SR & ~0x0Fu) | (1u<<2);\n");
         break;
     }
