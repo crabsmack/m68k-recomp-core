@@ -256,6 +256,14 @@ static int             s_all_func_count = 0;
 static const WsSite *s_ws_sites = NULL;
 /* game.toml exact_timing: cycle-exact emission (see emit_exact_insn_start). */
 static bool s_exact = false;
+/* Exact-mode structure WITH the timing (XI boundaries, XC costs). False for
+ * game.toml untimed / --untimed: the same code shape (label entries, hardware
+ * call/return, XSR after SR writes) with no instruction timing at all, for a
+ * runner that schedules by logical position instead of by clock. */
+static bool s_timed = false;
+/* game.toml entry_hooks: if (XENTRY(addr)) return; when control enters a function at its
+ * own start (a C-level call of func_ADDR, not a branch inside the body). */
+static bool s_entry_hooks = false;
 /* Exact mode: the labelled instructions a computed JMP in the current function
  * may land on (set per function before emission). */
 #define CASE_MAX 4096
@@ -2968,7 +2976,7 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
                                 func_name, func_addr);
             fprintf(f, "  /* Bcc no target */\n");
         }
-        if (s_exact)   /* not taken: Bcc.S 8, Bcc.W 12 (base 10 charged in XI) */
+        if (s_timed)   /* not taken: Bcc.S 8, Bcc.W 12 (base 10 charged in XI) */
             fprintf(f, "  XC(%d);\n", instr->byte_length == 2 ? -14 : 14);
         break;
     }
@@ -2984,7 +2992,7 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
         fprintf(f, "    g_cpu.D[%d] = (g_cpu.D[%d] & 0xFFFF0000u) | (uint32_t)((uint16_t)((uint16_t)(g_cpu.D[%d]) - 1u));\n",
                 dreg, dreg, dreg);
         fprintf(f, "    if ((int16_t)g_cpu.D[%d] != -1) {\n", dreg);
-        if (s_exact)
+        if (s_timed)
             fprintf(f, "      XC(-14); /* loop: 10 */\n");
         if (instr->has_target) {
             if (addrset_contains(instrs, instr->target_addr)) {
@@ -2996,7 +3004,7 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
             }
         }
         fprintf(f, "    }\n");
-        if (s_exact)
+        if (s_timed)
             fprintf(f, "    XC(14); /* counter expired: 14 */\n");
         fprintf(f, "  }\n");
         break;
@@ -3303,6 +3311,7 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
                 (unsigned)(instr->imm32 & 0xFFu));
         break;
     case MN_ORI_TO_SR:
+        if (s_exact && !s_timed) fprintf(f, "  XSRP();\n");
         fprintf(f, "  g_cpu.SR |= 0x%04Xu; /* ORI #imm,SR */\n",
                 (unsigned)(instr->imm32 & 0xFFFFu));
         if (s_exact) fprintf(f, "  XSR();\n");
@@ -3312,6 +3321,7 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
                 (unsigned)(0xFF00u | (instr->imm32 & 0xFFu)));
         break;
     case MN_ANDI_TO_SR:
+        if (s_exact && !s_timed) fprintf(f, "  XSRP();\n");
         fprintf(f, "  g_cpu.SR &= 0x%04Xu; /* ANDI #imm,SR */\n",
                 (unsigned)(instr->imm32 & 0xFFFFu));
         if (s_exact) fprintf(f, "  XSR();\n");
@@ -3321,6 +3331,7 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
                 (unsigned)(instr->imm32 & 0xFFu));
         break;
     case MN_EORI_TO_SR:
+        if (s_exact && !s_timed) fprintf(f, "  XSRP();\n");
         fprintf(f, "  g_cpu.SR ^= 0x%04Xu; /* EORI #imm,SR */\n",
                 (unsigned)(instr->imm32 & 0xFFFFu));
         if (s_exact) fprintf(f, "  XSR();\n");
@@ -3564,9 +3575,9 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
     case MN_LSL:
     case MN_LSR: {
         if (instr->mem_shift) { emit_mem_shift(f, instr, addr, &er); break; }
-        if (s_exact && instr->src_ea >= 0)   /* count register: 2 per bit, mod 64 */
+        if (s_timed && instr->src_ea >= 0)   /* count register: 2 per bit, mod 64 */
             fprintf(f, "  XC(14u * (g_cpu.D[%d] & 63u));\n", instr->src_ea);
-        else if (s_exact && !instr->mem_shift && ((instr->words[0] >> 5) & 1))
+        else if (s_timed && !instr->mem_shift && ((instr->words[0] >> 5) & 1))
             fprintf(f, "  XC(14u * (g_cpu.D[%d] & 63u));\n", (instr->words[0] >> 9) & 7);
         int dreg  = instr->reg;
         bool left = (instr->mnemonic == MN_LSL);
@@ -3630,9 +3641,9 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
     case MN_ASL:
     case MN_ASR: {
         if (instr->mem_shift) { emit_mem_shift(f, instr, addr, &er); break; }
-        if (s_exact && instr->src_ea >= 0)   /* count register: 2 per bit, mod 64 */
+        if (s_timed && instr->src_ea >= 0)   /* count register: 2 per bit, mod 64 */
             fprintf(f, "  XC(14u * (g_cpu.D[%d] & 63u));\n", instr->src_ea);
-        else if (s_exact && !instr->mem_shift && ((instr->words[0] >> 5) & 1))
+        else if (s_timed && !instr->mem_shift && ((instr->words[0] >> 5) & 1))
             fprintf(f, "  XC(14u * (g_cpu.D[%d] & 63u));\n", (instr->words[0] >> 9) & 7);
         int dreg  = instr->reg;
         bool asr_reg_count = (instr->src_ea >= 0);
@@ -3723,9 +3734,9 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
     case MN_ROL:
     case MN_ROR: {
         if (instr->mem_shift) { emit_mem_shift(f, instr, addr, &er); break; }
-        if (s_exact && instr->src_ea >= 0)   /* count register: 2 per bit, mod 64 */
+        if (s_timed && instr->src_ea >= 0)   /* count register: 2 per bit, mod 64 */
             fprintf(f, "  XC(14u * (g_cpu.D[%d] & 63u));\n", instr->src_ea);
-        else if (s_exact && !instr->mem_shift && ((instr->words[0] >> 5) & 1))
+        else if (s_timed && !instr->mem_shift && ((instr->words[0] >> 5) & 1))
             fprintf(f, "  XC(14u * (g_cpu.D[%d] & 63u));\n", (instr->words[0] >> 9) & 7);
         int dreg  = instr->reg;
         bool rot_reg_count = (instr->src_ea >= 0);
@@ -3785,9 +3796,9 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
     case MN_ROXL:
     case MN_ROXR: {
         if (instr->mem_shift) { emit_mem_shift(f, instr, addr, &er); break; }
-        if (s_exact && instr->src_ea >= 0)   /* count register: 2 per bit, mod 64 */
+        if (s_timed && instr->src_ea >= 0)   /* count register: 2 per bit, mod 64 */
             fprintf(f, "  XC(14u * (g_cpu.D[%d] & 63u));\n", instr->src_ea);
-        else if (s_exact && !instr->mem_shift && ((instr->words[0] >> 5) & 1))
+        else if (s_timed && !instr->mem_shift && ((instr->words[0] >> 5) & 1))
             fprintf(f, "  XC(14u * (g_cpu.D[%d] & 63u));\n", (instr->words[0] >> 9) & 7);
         int dreg  = instr->reg;
         int count = (int)(instr->imm32 & 63);
@@ -3831,7 +3842,7 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
     case MN_MULU: {
         int dreg = instr->reg;
         emit_ea_load(f, instr, instr->src_ea, M68K_SIZE_W, &er, tmp, src_expr);
-        if (s_exact)
+        if (s_timed)
             fprintf(f, "  XC(x68k_mulu_mclk((uint16_t)(%s)));\n", src_expr);
         fprintf(f,
             "  g_cpu.D[%d] = (uint32_t)(uint16_t)g_cpu.D[%d] * (uint32_t)(uint16_t)(%s);\n",
@@ -3846,7 +3857,7 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
     case MN_MULS: {
         int dreg = instr->reg;
         emit_ea_load(f, instr, instr->src_ea, M68K_SIZE_W, &er, tmp, src_expr);
-        if (s_exact)
+        if (s_timed)
             fprintf(f, "  XC(x68k_muls_mclk((int16_t)(%s)));\n", src_expr);
         fprintf(f,
             "  g_cpu.D[%d] = (uint32_t)((int32_t)(int16_t)g_cpu.D[%d] * (int32_t)(int16_t)(%s));\n",
@@ -3872,14 +3883,16 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
                 "    if (_dv == 0u) { g_cpu.SR &= ~(1u<<0); x68k_divide_by_zero(0x%06Xu); }\n"
                 "    else { uint32_t _quo = _dest / _dv, _rem = _dest %% _dv;\n"
                 "      if (_quo < 0x10000u) {\n"
-                "        XC(x68k_divu_mclk(_dest, _dv));\n"
+                "        %s\n"
                 "        g_cpu.D[%d] = (_quo & 0xFFFFu) | ((_rem & 0xFFFFu) << 16);\n"
                 "        g_cpu.SR &= ~((1u<<3)|(1u<<2)|(1u<<1)|(1u<<0));\n"
                 "        if (_quo & 0x8000u) g_cpu.SR |= (1u<<3);\n"
                 "        if ((_quo & 0xFFFFu) == 0u) g_cpu.SR |= (1u<<2);\n"
-                "      } else { XC(70); g_cpu.SR |= (1u<<1)|(1u<<3); g_cpu.SR &= ~(1u<<0); }\n"
+                "      } else { %s g_cpu.SR |= (1u<<1)|(1u<<3); g_cpu.SR &= ~(1u<<0); }\n"
                 "    }\n  }\n",
-                src_expr, dreg, instr->addr + instr->byte_length, dreg);
+                src_expr, dreg, instr->addr + instr->byte_length,
+                s_timed ? "XC(x68k_divu_mclk(_dest, _dv));" : "", dreg,
+                s_timed ? "XC(70);" : "");
             break;
         }
         /* HW-accurate (matches clown68000 / the Tier-3 floor): on quotient
@@ -3914,7 +3927,7 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
             fprintf(f,
                 "  { int32_t _dv = (int16_t)(%s); int32_t _dest = (int32_t)g_cpu.D[%d];\n"
                 "    if (_dv == 0) { g_cpu.SR &= ~(1u<<0); x68k_divide_by_zero(0x%06Xu); }\n"
-                "    else { XC(x68k_divs_mclk(_dest, (int16_t)_dv));\n"
+                "    else { %s\n"
                 "      if ((uint32_t)_dest == 0x80000000u && _dv == -1) {\n"
                 "        g_cpu.D[%d] = 0u; g_cpu.SR = (uint16_t)((g_cpu.SR & ~0x0Fu) | (1u<<2));\n"
                 "      } else { int32_t _quo = _dest / _dv, _rem = _dest %% _dv;\n"
@@ -3926,7 +3939,8 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
                 "        } else { g_cpu.SR |= (1u<<1)|(1u<<3); g_cpu.SR &= ~(1u<<0); }\n"
                 "      }\n"
                 "    }\n  }\n",
-                src_expr, dreg, instr->addr + instr->byte_length, dreg, dreg);
+                src_expr, dreg, instr->addr + instr->byte_length,
+                s_timed ? "XC(x68k_divs_mclk(_dest, (int16_t)_dv));" : "", dreg, dreg);
             break;
         }
         /* HW-accurate signed divide (matches clown68000 / the Tier-3 floor):
@@ -4172,7 +4186,9 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
             emit_ea_load(f, instr, instr->src_ea, M68K_SIZE_W, &er, tmp, src_expr);
             /* Mask to the valid 68000 SR bits (T,S,I2-0,X,N,Z,V,C = 0xA71F) —
              * unused bits read as 0 on hardware. */
+            if (s_exact && !s_timed) fprintf(f, "  XSRP();\n");
             fprintf(f, "  g_cpu.SR = (uint16_t)((%s) & 0xA71Fu);\n", src_expr);
+
             if (s_exact) fprintf(f, "  XSR();\n");
         } else {
             emit_ea_store(f, instr, instr->src_ea, M68K_SIZE_W, &er, "g_cpu.SR");
@@ -4220,7 +4236,7 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
         ExtReader er_save = er;
         /* Write 0xFF or 0x00 */
         fprintf(f, "  { uint8_t _sval = (%s) ? 0xFFu : 0x00u;\n", ce);
-        if (s_exact && ea_is_reg(instr->src_ea) && cond > 1)
+        if (s_timed && ea_is_reg(instr->src_ea) && cond > 1)
             fprintf(f, "    if (_sval) XC(14); /* Scc Dn true: 6 */\n");
         emit_ea_store(f, instr, instr->src_ea, M68K_SIZE_B, &er_save, "_sval");
         fprintf(f, "  }\n");
@@ -4787,6 +4803,10 @@ bool codegen_emit(const GenesisRom *rom, const FunctionList *funcs,
     s_extra_seed_count = cfg ? cfg->extra_seed_count : 0;
     s_ws_sites      = cfg ? cfg->ws_sites      : NULL;
     s_exact         = cfg ? cfg->exact_timing  : false;
+    s_timed         = s_exact && !(cfg && cfg->untimed);
+    s_entry_hooks   = cfg ? cfg->entry_hooks   : false;
+    if (s_exact && !s_timed)
+        printf("[Codegen] untimed: exact-mode structure without XI/XC timing\n");
     s_ws_site_count = cfg ? cfg->ws_site_count : 0;
     if (s_ws_site_count)
         printf("[Codegen] [widescreen] %d injection sites armed (recompile-time)\n",
@@ -5011,6 +5031,16 @@ bool codegen_emit(const GenesisRom *rom, const FunctionList *funcs,
         uint32_t walk_start = entry_owners[i];
         if (walk_start != func_addr)
             continue; /* emitted by the canonical host's shared body below */
+        /* --skip: the function is supplied by other code (hand-written C behind a
+         * func_ADDR slot entry). Declared in the header, never emitted; its interior
+         * labels get no entries, so a computed jump into it is a loud dispatch miss. */
+        if (cfg && cfg->skip_count) {
+            bool skip = false;
+            for (int k = 0; k < cfg->skip_count && !skip; k++)
+                skip = cfg->skip_addrs[k] == func_addr;
+            if (skip)
+                continue;
+        }
         int group_count = 0;
         for (int a = 0; a < all_funcs.count; a++)
             if (entry_owners[a] == func_addr) group_count++;
@@ -5155,8 +5185,11 @@ bool codegen_emit(const GenesisRom *rom, const FunctionList *funcs,
                     func_addr);
         else if (lbl_entries)
             fprintf(f_func, "static void func_body_%06X(uint32_t _entry) {\n", func_addr);
-        else
+        else {
             fprintf(f_func, "void func_%06X(void) {\n", func_addr);
+            if (s_entry_hooks)
+                fprintf(f_func, "  if (XENTRY(0x%06Xu)) return;\n", func_addr);
+        }
         if (s_reverse_debug) {
             if (has_aliases) {
                 fprintf(f_func, "  g_rdb_current_func = _entry;\n");
@@ -5362,7 +5395,7 @@ bool codegen_emit(const GenesisRom *rom, const FunctionList *funcs,
             /* Exact mode: every instruction starts at a boundary where the
              * scheduler may end the time slice or take an interrupt (pc is the
              * address an interrupt pushes), then charges its exact cost. */
-            if (s_exact)
+            if (s_timed)
                 fprintf(f_func, "  XI(0x%06Xu, %du);\n", pc, 7u * (unsigned)estimate_cycles(&instr));
 
             /* Push-then-RTS: `move.l <ea>,-(sp)` or `pea <ea>` falling straight
@@ -5469,8 +5502,12 @@ bool codegen_emit(const GenesisRom *rom, const FunctionList *funcs,
 
         if (lbl_entries) {
             /* The function itself and each enterable label share the body. */
-            fprintf(f_func, "void func_%06X(void) { func_body_%06X(0x%06Xu); }\n",
-                    func_addr, func_addr, func_addr);
+            if (s_entry_hooks)
+                fprintf(f_func, "void func_%06X(void) { if (XENTRY(0x%06Xu)) return; func_body_%06X(0x%06Xu); }\n",
+                        func_addr, func_addr, func_addr, func_addr);
+            else
+                fprintf(f_func, "void func_%06X(void) { func_body_%06X(0x%06Xu); }\n",
+                        func_addr, func_addr, func_addr);
             for (int k = lbl_first; k < s_lbl_count; k++)
                 fprintf(f_func, "void func_%06X(void) { func_body_%06X(0x%06Xu); }\n",
                         s_lbl[k].label, func_addr, s_lbl[k].label);
@@ -5486,9 +5523,14 @@ bool codegen_emit(const GenesisRom *rom, const FunctionList *funcs,
                 const char *alias_name = annotations_get_name(at, entry);
                 if (alias_name)
                     fprintf(f_func, "/* %s */\n", alias_name);
-                fprintf(f_func,
-                        "void func_%06X(void) { func_body_%06X(0x%06Xu); }\n",
-                        entry, func_addr, entry);
+                if (s_entry_hooks)
+                    fprintf(f_func,
+                            "void func_%06X(void) { if (XENTRY(0x%06Xu)) return; func_body_%06X(0x%06Xu); }\n",
+                            entry, entry, func_addr, entry);
+                else
+                    fprintf(f_func,
+                            "void func_%06X(void) { func_body_%06X(0x%06Xu); }\n",
+                            entry, func_addr, entry);
             }
             fprintf(f_func, "\n");
         }
