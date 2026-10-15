@@ -5085,6 +5085,32 @@ bool codegen_emit(const GenesisRom *rom, const FunctionList *funcs,
                 }
             }
 
+            /* Push-then-RTS: `move.l <ea>,-(sp)` or `pea <ea>` falling straight
+             * into an RTS that no branch targets is a computed jump to the pushed
+             * address: the RTS pops the long just pushed, not the caller's return
+             * slot. Emitted as a C return it would leave that long on the stack and
+             * resume the caller (X-Men 2's boot hand-off `move.l ($21C).w,-(a7);
+             * rts`). Pop it and tail-dispatch, as the 68000 does. */
+            if (instr.mnemonic == MN_RTS && j > 0 && !addrset_contains(&labels, pc)) {
+                M68KInstr prev;
+                if (m68k_decode(rom, instrs.addrs[j - 1], &prev) &&
+                    instrs.addrs[j - 1] + prev.byte_length == pc &&
+                    ((prev.mnemonic == MN_MOVE && prev.size == M68K_SIZE_L &&
+                      prev.dst_ea == ((EA_An_PRE << 3) | 7)) ||
+                     prev.mnemonic == MN_PEA)) {
+                    fprintf(f_func, "  /* $%06X: rts after a pushed long = jump to it */\n", pc);
+                    fprintf(f_func, "  { uint32_t _pushed = m68k_read32(g_cpu.A[7]) & 0xFFFFFFu; "
+                                    "g_cpu.A[7] += 4;\n");
+                    if (has_sp_adjust)
+                        fprintf(f_func, "    _sp_popped += 1; /* the pushed long is consumed */\n");
+                    emit_split_tail_call_expr(f_func, "    ", "_pushed", has_sp_adjust != 0,
+                                              estimate_cycles(&instr));
+                    fprintf(f_func, "  }\n");
+                    skip_until_label = true;
+                    continue;
+                }
+            }
+
             fprintf(f_func, "  /* $%06X */\n", pc);
             if (s_reverse_debug)
                 fprintf(f_func, "  rdb_on_insn(0x%06Xu);\n", pc);
