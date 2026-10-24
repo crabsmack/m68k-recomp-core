@@ -1002,8 +1002,12 @@ void function_finder_run(const GenesisRom *rom, FunctionList *list,
                 break;  /* JMP terminates the path either way */
             }
 
-            /* Terminator */
+            /* Terminator, or a call that never returns here (game.toml
+             * [functions].noreturn: the bytes after it are the callee's script) */
             if (m68k_is_terminator(&instr)) break;
+            if (m68k_is_call(&instr) && instr.has_target &&
+                    game_config_is_noreturn(cfg, instr.target_addr))
+                break;
 
             prev_instr = instr;
             have_prev = true;

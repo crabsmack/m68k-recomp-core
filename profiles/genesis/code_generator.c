@@ -255,6 +255,8 @@ static int             s_all_func_count = 0;
  * TOML. This is the post-patch widening layer: the ROM is recompiled
  * unmodified and the widening lives entirely in the emitted C. */
 static const WsSite *s_ws_sites = NULL;
+/* The game config, for per-site semantics during emission ([functions].noreturn). */
+static const GameConfig *s_cfg = NULL;
 /* game.toml exact_timing: cycle-exact emission (see emit_exact_insn_start). */
 static bool s_exact = false;
 /* Exact-mode structure WITH the timing (XI boundaries, XC costs). False for
@@ -1587,6 +1589,10 @@ static void scan_function(const GenesisRom *rom, uint32_t start_addr,
                     if (proven)
                         addrset_insert(extern_targets, instr.target_addr);
                 }
+                /* A callee that never returns here: the bytes after the call
+                 * are its script (game.toml [functions].noreturn). */
+                if (instr.has_target && game_config_is_noreturn(cfg, instr.target_addr))
+                    goto next_work;
                 break;
 
             default:
@@ -1984,7 +1990,7 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
         if (s_exact) {
             /* Hardware RTS: pop the return target; call sites compare it (see
              * the exact JSR emission) and unwind until it matches. */
-            fprintf(f, "  g_xrts = m68k_read32(g_cpu.A[7]) & 0xFFFFFFu; g_cpu.A[7] += 4;\n");
+            fprintf(f, "  g_xrts = m68k_read32(g_cpu.A[7]) & 0xFFFFFFu; g_cpu.A[7] += 4; g_xrts_new = 1;\n");
             fprintf(f, "  return;\n");
             *skip_until_label = true;
             break;
@@ -2024,7 +2030,10 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
         fprintf(f, "  g_cpu.PC = m68k_read32(g_cpu.A[7]);            g_cpu.A[7] += 4; /* RTE: pop PC */\n");
         if (s_exact) fprintf(f, "  XSR();\n");
         emit_cycle_accounting(f, "  ", estimate_cycles(instr));
-        fprintf(f, "  g_rte_pending = 1; return; /* RTE */\n");
+        if (s_exact)   /* an interrupt return, or outside a handler a jump (x68k_rte) */
+            fprintf(f, "  x68k_rte(); return; /* RTE */\n");
+        else
+            fprintf(f, "  g_rte_pending = 1; return; /* RTE */\n");
         *skip_until_label = true;
         break;
 
@@ -2150,7 +2159,11 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
              * unwinds until the call site it did return to. No stack-slot
              * bookkeeping: the 68000 stack is the truth. An RTE in an interrupt
              * handler unwinds the same way via g_rte_pending. */
-            fprintf(f, "  recomp_push_return(0x%06Xu); /* JSR push */\n", ret_addr);
+            /* The site waits for its return address (XCALL_BEGIN/END): an RTS
+             * that lands where no site waits is run next by the dispatcher
+             * (x68k_resume), as the 68000 continues there. */
+            fprintf(f, "  recomp_push_return(0x%06Xu); XCALL_BEGIN(0x%06Xu); /* JSR push */\n",
+                    ret_addr, ret_addr);
             if (instr->has_target) {
                 if (func_is_known(bsr_target))
                     fprintf(f, "  recomp_call_func(func_%06X);\n", bsr_target);
@@ -2166,9 +2179,16 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
                                     instr->words[0], instr->mnemonic, func_name, func_addr);
                 fprintf(f, "  /* TODO: dynamic JSR/BSR EA %d/%d */\n", mode, reg);
             }
+            fprintf(f, "  XCALL_END();\n");
             fprintf(f, "  if (g_rte_pending || g_xrts != 0x%06Xu) return; /* returned further out */\n",
                     ret_addr);
-            if (!addrset_contains(instrs, ret_addr)) {
+            fprintf(f, "  XRTS_TAKEN();\n");
+            if (instr->has_target && game_config_is_noreturn(s_cfg, bsr_target)) {
+                /* The callee never returns here: the bytes after the call are its
+                 * script, not code ([functions].noreturn). */
+                fprintf(f, "  return; /* noreturn callee */\n");
+                *skip_until_label = true;
+            } else if (!addrset_contains(instrs, ret_addr)) {
                 /* Discovery made the continuation its own function. */
                 emit_split_tail_call(f, "  ", ret_addr, false, -1);
                 *skip_until_label = true;
@@ -2176,7 +2196,8 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
             break;
         }
         if (instr->has_target &&
-            function_finder_pops_return_unconditionally(rom, instr->target_addr)) {
+            (function_finder_pops_return_unconditionally(rom, instr->target_addr) ||
+             game_config_is_noreturn(s_cfg, instr->target_addr))) {
             fprintf(f, "  recomp_push_return(0x%06Xu); /* JSR push (callee captures return) */\n",
                     ret_addr);
             fprintf(f, "  { int _saved_split_sp_popped = g_split_sp_popped; g_split_sp_popped = 0;\n");
@@ -4344,6 +4365,7 @@ bool codegen_emit(const GenesisRom *rom, const FunctionList *funcs,
     s_extra_seeds      = cfg ? cfg->extra_seeds      : NULL;
     s_extra_seed_count = cfg ? cfg->extra_seed_count : 0;
     s_ws_sites      = cfg ? cfg->ws_sites      : NULL;
+    s_cfg           = cfg;
     s_exact         = cfg ? cfg->exact_timing  : false;
     s_timed         = s_exact && !(cfg && cfg->untimed);
     s_entry_hooks   = cfg ? cfg->entry_hooks   : false;
@@ -5232,6 +5254,9 @@ bool codegen_emit(const GenesisRom *rom, const FunctionList *funcs,
         "    g_recomp_tail_frame->addr = addr & 0xFFFFFFu;\n"
         "    g_recomp_tail_frame->pending = 1;\n"
         "}\n\n"
+        "static int recomp_has_func(uint32_t addr) {\n"
+        "    return recomp_find_func(addr) != NULL;\n"
+        "}\n\n"
         "static void recomp_dispatch_once(uint32_t addr) {\n"
         "    addr = recomp_resolve_ram_trampoline(addr);\n"
         "    if (recomp_dispatch_ram_stub(addr))\n"
@@ -5241,17 +5266,30 @@ bool codegen_emit(const GenesisRom *rom, const FunctionList *funcs,
         "        fn();\n"
         "        return;\n"
         "    }\n"
-        "    if (!g_game_spec.dispatch_override || !g_game_spec.dispatch_override(addr))\n"
-        "        genesis_log_dispatch_miss(addr);\n"
+        "    if (g_game_spec.dispatch_override && g_game_spec.dispatch_override(addr))\n"
+        "        return;\n"
+        "    /* exact mode: ROM code resumed mid-function (a parked task) runs on the exact\n"
+        "     * interpreter until generated code can take over */\n"
+        "    if (recomp_exact_rom_resume(addr, recomp_has_func))\n"
+        "        return;\n"
+        "    genesis_log_dispatch_miss(addr);\n"
         "}\n\n"
         "static void recomp_drain_tailcalls(RecompTailFrame *frame) {\n"
         "    unsigned guard = 0;\n"
-        "    while (frame->pending) {\n"
+        "    uint64_t insn = g_xinsn;\n"
+        "    for (;;) {\n"
+        "        /* exact mode: an RTS no call site waits for is where the 68000\n"
+        "         * continues (a threaded-code handler returning into its loop) */\n"
+        "        if (!frame->pending && !g_rte_pending && x68k_resume(&frame->addr))\n"
+        "            frame->pending = 1;\n"
+        "        if (!frame->pending)\n"
+        "            break;\n"
         "        uint32_t addr = frame->addr;\n"
         "        frame->pending = 0;\n"
         "        recomp_dispatch_once(addr);\n"
         "        if (g_rte_pending)\n"
         "            break;\n"
+        "        if (g_xinsn != insn) { insn = g_xinsn; guard = 0; }  /* exact: code ran */\n"
         "        if (++guard > 1000000u) {\n"
         "            fprintf(stderr, \"recompiled tail-dispatch runaway at $%%06X\\n\", addr);\n"
         "            exit(2);\n"
