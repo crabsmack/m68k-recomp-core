@@ -15,6 +15,7 @@ function(m68k_recomp_core_sources out_var profile)
 
     set(sources
         "${M68K_RECOMP_CORE_ROOT}/common/m68k_decoder.c"
+        "${M68K_RECOMP_CORE_ROOT}/common/m68k_cycles.c"
         "${M68K_RECOMP_CORE_ROOT}/common/m68k_validator.c"
         "${M68K_RECOMP_CORE_ROOT}/common/annotations.c"
         ${profile_extra_sources}
