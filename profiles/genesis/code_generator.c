@@ -611,12 +611,14 @@ static void emit_ea_addr_ex(FILE *f, const M68KInstr *instr, int ea,
             snprintf(out_expr, 256, "0x%08Xu", addr);
             break;
         }
+        /* PC-relative. Exact mode adds the PC's top byte (g_pchi): the address an LEA/PEA
+         * leaves is the 68000's whole PC plus the displacement. */
         case 2: {
             uint32_t pc_addr = instr->addr + er->bp;
             uint16_t ext = er_next(er);
             int16_t d16 = (int16_t)ext;
             uint32_t eff = (uint32_t)((int32_t)pc_addr + (int32_t)d16);
-            snprintf(out_expr, 256, "0x%08Xu", eff);
+            snprintf(out_expr, 256, s_exact ? "(uint32_t)(g_pchi + 0x%08Xu)" : "0x%08Xu", eff);
             break;
         }
         case 3: {
@@ -626,9 +628,9 @@ static void emit_ea_addr_ex(FILE *f, const M68KInstr *instr, int ea,
             int8_t d8 = (int8_t)(ext & 0xFF);
             snprintf(out_expr, 256,
                      u_suffix
-                       ? "(uint32_t)(0x%08Xu + m68k_brief_index_value(0x%04Xu, g_cpu.D[%d], g_cpu.A[%d]) + (%d))"
-                       : "(uint32_t)(0x%08X + m68k_brief_index_value(0x%04Xu, g_cpu.D[%d], g_cpu.A[%d]) + (%d))",
-                     pc_addr, ext, xreg, xreg, (int)d8);
+                       ? "(uint32_t)(%s0x%08Xu + m68k_brief_index_value(0x%04Xu, g_cpu.D[%d], g_cpu.A[%d]) + (%d))"
+                       : "(uint32_t)(%s0x%08X + m68k_brief_index_value(0x%04Xu, g_cpu.D[%d], g_cpu.A[%d]) + (%d))",
+                     s_exact ? "g_pchi + " : "", pc_addr, ext, xreg, xreg, (int)d8);
             break;
         }
         default:
@@ -1109,6 +1111,17 @@ static void emit_split_tail_call_expr(FILE *f, const char *indent,
     } else {
         fprintf(f, "%srecomp_tail_call(%s); return;\n", indent, addr_expr);
     }
+}
+
+/* Exact mode: the PC's top byte after a JMP/JSR to a static target (g_pchi). An absolute
+ * operand sets it (abs.w sign-extends: $8000-$FFFF is $FFFF8000-$FFFFFFFF); a PC-relative one
+ * keeps it. */
+static void emit_pchi_static(FILE *f, const char *indent, const M68KInstr *instr, int ea) {
+    if (!s_exact || ((ea >> 3) & 7) != 7) return;
+    if ((ea & 7) == 0)
+        fprintf(f, "%sg_pchi = 0x%08Xu;\n", indent, (instr->words[1] & 0x8000u) ? 0xFF000000u : 0u);
+    else if ((ea & 7) == 1)
+        fprintf(f, "%sg_pchi = 0x%08Xu;\n", indent, (uint32_t)(instr->words[1] & 0xFF00u) << 16);
 }
 
 /* func_is_known — binary search in s_all_func_addrs for a JSR target. */
@@ -1990,7 +2003,8 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
         if (s_exact) {
             /* Hardware RTS: pop the return target; call sites compare it (see
              * the exact JSR emission) and unwind until it matches. */
-            fprintf(f, "  g_xrts = m68k_read32(g_cpu.A[7]) & 0xFFFFFFu; g_cpu.A[7] += 4; g_xrts_new = 1;\n");
+            fprintf(f, "  { uint32_t _ret = m68k_read32(g_cpu.A[7]); g_pchi = _ret & 0xFF000000u; g_xrts = _ret & 0xFFFFFFu; }\n");
+            fprintf(f, "  g_cpu.A[7] += 4; g_xrts_new = 1;\n");
             fprintf(f, "  return;\n");
             *skip_until_label = true;
             break;
@@ -2165,6 +2179,8 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
             fprintf(f, "  recomp_push_return(0x%06Xu); XCALL_BEGIN(0x%06Xu); /* JSR push */\n",
                     ret_addr, ret_addr);
             if (instr->has_target) {
+                if (instr->mnemonic == MN_JSR)
+                    emit_pchi_static(f, "  ", instr, ea);
                 if (func_is_known(bsr_target))
                     fprintf(f, "  recomp_call_func(func_%06X);\n", bsr_target);
                 else
@@ -2173,7 +2189,9 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
             } else if (mode == 2 || mode == 5 || mode == 6 || (mode == 7 && reg <= 3)) {
                 char ae[256];
                 emit_ea_addr_ex(f, instr, ea, &er, ae, true);
-                fprintf(f, "  recomp_call_addr(%s);\n", ae);
+                /* the target's top byte is the PC's from here on */
+                fprintf(f, "  { uint32_t _jr = %s; g_pchi = _jr & 0xFF000000u; recomp_call_addr(_jr & 0xFFFFFFu); }\n",
+                        ae);
             } else {
                 codegen_diag_record(CGD_TODO_DYNAMIC_JSR_UNSUPPORTED, addr,
                                     instr->words[0], instr->mnemonic, func_name, func_addr);
@@ -2298,6 +2316,7 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
         if (instr->has_target) {
             audit_record(instr->addr, func_addr, instr->target_addr,
                          JMPAUDIT_STATIC_TARGET, 0);
+            emit_pchi_static(f, "  ", instr, ea);
             if (addrset_contains(instrs, instr->target_addr)) {
                 emit_cycle_accounting(f, "  ", estimate_cycles(instr));
                 fprintf(f, "  goto label_%06X;\n", instr->target_addr);
@@ -2315,7 +2334,7 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
                          s_case_count);
             char ae[256];
             emit_ea_addr_ex(f, instr, ea, &er, ae, true);
-            fprintf(f, "  { uint32_t _jt = (uint32_t)(%s) & 0xFFFFFFu;\n", ae);
+            fprintf(f, "  { uint32_t _jt = (uint32_t)(%s); g_pchi = _jt & 0xFF000000u; _jt &= 0xFFFFFFu;\n", ae);
             if (s_case_count) {
                 fprintf(f, "    switch (_jt) {\n");
                 for (int c = 0; c < s_case_count; c++)
@@ -5258,6 +5277,10 @@ bool codegen_emit(const GenesisRom *rom, const FunctionList *funcs,
         "    return recomp_find_func(addr) != NULL;\n"
         "}\n\n"
         "static void recomp_dispatch_once(uint32_t addr) {\n"
+        "    /* exact mode: RAM code runs on the exact interpreter as fetched, until ROM code\n"
+        "     * generated code can be entered at */\n"
+        "    if (recomp_exact_ram_run(addr, recomp_has_func))\n"
+        "        return;\n"
         "    addr = recomp_resolve_ram_trampoline(addr);\n"
         "    if (recomp_dispatch_ram_stub(addr))\n"
         "        return;\n"
