@@ -434,6 +434,58 @@ static void emit_store_dn(FILE *f, const char *indent,
 }
 
 /* =========================================================================
+ * RAM code overlays (game.toml [[ram_code]]): while one is emitted, s_ovl is
+ * its template, decoded at its RAM address. An absolute-address extension
+ * word holding a live byte (one the game rewrites) is not a literal: the
+ * instruction reads it from RAM (_lw[slot], loaded where the interpreter
+ * would decode it). Every live byte an emitter consumes is marked, so a live
+ * byte no emitter turned into a run-time read fails the generation instead
+ * of being baked in.
+ * ========================================================================= */
+static const GameRamCode *s_ovl = NULL;
+static int     s_ovl_slot[GAMECFG_RAM_CODE_MAX_LEN];   /* word offset -> _lw slot (-1) */
+static uint8_t s_ovl_used[GAMECFG_RAM_CODE_MAX_LEN];   /* live byte read at run time   */
+
+static int ovl_slot(uint32_t word_addr) {
+    if (!s_ovl) return -1;
+    uint32_t off = (word_addr & 0xFFFFFFu) - s_ovl->addr;
+    if (off >= s_ovl->len || s_ovl_slot[off] < 0) return -1;
+    s_ovl_used[off] = 1;
+    if (off + 1 < s_ovl->len) s_ovl_used[off + 1] = 1;
+    return s_ovl_slot[off];
+}
+
+/* An abs.W operand's address: the literal, or the live word. */
+static void absw_expr(char *out, size_t n, uint32_t word_addr, uint16_t ext) {
+    int k = ovl_slot(word_addr);
+    if (k >= 0) snprintf(out, n, "(uint32_t)(int32_t)(int16_t)_lw[%d]", k);
+    else        snprintf(out, n, "(uint32_t)(int32_t)(int16_t)0x%04X", ext);
+}
+
+/* An abs.L operand's address: the literal (in the call site's own format), or
+ * the long built from its live word(s). */
+static void absl_expr(char *out, size_t n, uint32_t word_addr, uint32_t v, const char *fmt) {
+    int kh = ovl_slot(word_addr), kl = ovl_slot(word_addr + 2u);
+    if (kh < 0 && kl < 0) { snprintf(out, n, fmt, v); return; }
+    char hi[32], lo[32];
+    if (kh >= 0) snprintf(hi, sizeof hi, "(uint32_t)_lw[%d]", kh);
+    else         snprintf(hi, sizeof hi, "0x%04Xu", (unsigned)(v >> 16));
+    if (kl >= 0) snprintf(lo, sizeof lo, "(uint32_t)_lw[%d]", kl);
+    else         snprintf(lo, sizeof lo, "0x%04Xu", (unsigned)(v & 0xFFFFu));
+    snprintf(out, n, "((%s << 16) | %s)", hi, lo);
+}
+
+/* True when the instruction's extension words hold a live byte. */
+static bool ovl_insn_live(const M68KInstr *instr) {
+    if (!s_ovl) return false;
+    for (uint32_t b = 2; b < instr->byte_length; b++) {
+        uint32_t off = instr->addr + b - s_ovl->addr;
+        if (off < s_ovl->len && s_ovl->live[off]) return true;
+    }
+    return false;
+}
+
+/* =========================================================================
  * emit_ea_load — emit pre-statements and fill out_expr with C rvalue
  * ========================================================================= */
 
@@ -494,17 +546,22 @@ static void emit_ea_load_ex(FILE *f, const M68KInstr *instr, int ea, M68KSize sz
     case 7:
         switch (reg) {
         case 0: { /* abs.W */
+            uint32_t wa = instr->addr + er->bp;
             uint16_t ext = er_next(er);
-            fprintf(f, "  %s %s = %s((uint32_t)(int32_t)(int16_t)0x%04X);\n",
-                    ct, tmp, rf, ext);
+            char a[96];
+            absw_expr(a, sizeof a, wa, ext);
+            fprintf(f, "  %s %s = %s(%s);\n", ct, tmp, rf, a);
             snprintf(out_expr, 256, "%s", tmp);
             break;
         }
         case 1: { /* abs.L */
+            uint32_t wa = instr->addr + er->bp;
             uint16_t hi = er_next(er);
             uint16_t lo = er_next(er);
             uint32_t addr = ((uint32_t)hi << 16) | lo;
-            fprintf(f, "  %s %s = %s(0x%08X);\n", ct, tmp, rf, addr);
+            char a[96];
+            absl_expr(a, sizeof a, wa, addr, "0x%08X");
+            fprintf(f, "  %s %s = %s(%s);\n", ct, tmp, rf, a);
             snprintf(out_expr, 256, "%s", tmp);
             break;
         }
@@ -602,13 +659,15 @@ static void emit_ea_addr_ex(FILE *f, const M68KInstr *instr, int ea,
     case 7:
         switch (reg) {
         case 0: {
+            uint32_t wa = instr->addr + er->bp;
             uint16_t ext = er_next(er);
-            snprintf(out_expr, 256, "(uint32_t)(int32_t)(int16_t)0x%04X", ext);
+            absw_expr(out_expr, 256, wa, ext);
             break;
         }
         case 1: {
+            uint32_t wa = instr->addr + er->bp;
             uint32_t addr = er_next_dword(er);
-            snprintf(out_expr, 256, "0x%08Xu", addr);
+            absl_expr(out_expr, 256, wa, addr, "0x%08Xu");
             break;
         }
         /* PC-relative. Exact mode adds the PC's top byte (g_pchi): the address an LEA/PEA
@@ -731,16 +790,21 @@ static void emit_ea_store_ex(FILE *f, const M68KInstr *instr, int ea, M68KSize s
     case 7:
         switch (reg) {
         case 0: {
+            uint32_t wa = instr->addr + er->bp;
             uint16_t ext = er_next(er);
-            fprintf(f, "  %s((uint32_t)(int32_t)(int16_t)0x%04X, (%s)(%s));\n",
-                    wf, ext, ct, val_expr);
+            char a[96];
+            absw_expr(a, sizeof a, wa, ext);
+            fprintf(f, "  %s(%s, (%s)(%s));\n", wf, a, ct, val_expr);
             break;
         }
         case 1: {
+            uint32_t wa = instr->addr + er->bp;
             uint16_t hi = er_next(er);
             uint16_t lo = er_next(er);
             uint32_t addr = ((uint32_t)hi << 16) | lo;
-            fprintf(f, "  %s(0x%08Xu, (%s)(%s));\n", wf, addr, ct, val_expr);
+            char a[96];
+            absl_expr(a, sizeof a, wa, addr, "0x%08Xu");
+            fprintf(f, "  %s(%s, (%s)(%s));\n", wf, a, ct, val_expr);
             break;
         }
         default:
@@ -2313,7 +2377,8 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
         int ea   = instr->src_ea;
         int mode = (ea >> 3) & 7;
         int reg  = ea & 7;
-        if (instr->has_target) {
+        /* RAM code whose absolute target the game rewrites: a computed JMP (below) */
+        if (instr->has_target && !ovl_insn_live(instr)) {
             audit_record(instr->addr, func_addr, instr->target_addr,
                          JMPAUDIT_STATIC_TARGET, 0);
             emit_pchi_static(f, "  ", instr, ea);
@@ -4291,6 +4356,224 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
  * Main codegen entry point
  * ========================================================================= */
 
+/* An instruction that can change A7 by whole longwords (see the `_sp_popped`
+ * pre-scan in codegen_emit). */
+static bool insn_adjusts_sp(const M68KInstr *pre) {
+    if ((pre->mnemonic == MN_ADDQ || pre->mnemonic == MN_ADDA) &&
+        ((pre->src_ea >> 3) & 7) == 1 && (pre->src_ea & 7) == 7 &&
+        pre->size == M68K_SIZE_L && (pre->imm32 % 4) == 0 && pre->imm32 > 0)
+        return true;
+    if (pre->size == M68K_SIZE_L
+            && (pre->mnemonic == MN_MOVE || pre->mnemonic == MN_MOVEA)
+            && pre->src_ea == ((EA_An_POST << 3) | 7))
+        return true;
+    if (pre->size == M68K_SIZE_L && pre->mnemonic == MN_MOVE
+            && pre->dst_ea == ((EA_An_PRE << 3) | 7))
+        return true;
+    if (pre->size == M68K_SIZE_L && pre->mnemonic == MN_MOVEM) {
+        int dir = (pre->words[0] >> 10) & 1;
+        int mode = (pre->src_ea >> 3) & 7;
+        int reg = pre->src_ea & 7;
+        if (reg == 7 && ((dir == 1 && mode == 3) || (dir == 0 && mode == 4)))
+            return true;
+    }
+    return false;
+}
+
+/* =========================================================================
+ * RAM code overlays (game.toml [[ram_code]], exact timing only)
+ *
+ * The exact interpreter runs RAM code as fetched: per instruction its
+ * boundary (XI_BOUNDARY), the decode from live RAM, the exact cost
+ * (XI_CHARGE), then the instruction. An overlay is the same, generated: the
+ * template (the bytes the game copies there) decoded linearly at its RAM
+ * address, one labelled C block per instruction:
+ *   - the boundary; when it ran the scheduler (an interrupt may have patched
+ *     RAM), or the previous instruction may have written the template, the
+ *     template is checked again, and on a mismatch the interpreter takes over
+ *     at this instruction, past its boundary (recomp_exact_ram_resume);
+ *   - live operand words loaded from RAM (what the decode would read), a live
+ *     Bcc.S displacement checked against the template's instruction starts;
+ *   - XI_CHARGE with the cost the interpreter charges (m68k_cycles_exact);
+ *   - emit_instr's body, live absolute operands read from the loaded words.
+ * The runner enters it only when RAM holds the template (runner/glue.c). */
+typedef struct { const GenesisRom *rom; const GameRamCode *rc; } OvlFetch;
+static uint8_t ovl_fetch8(uint32_t addr, void *user) {
+    const OvlFetch *o = (const OvlFetch *)user;
+    addr &= 0xFFFFFFu;
+    uint32_t off = addr - o->rc->addr;
+    if (off < o->rc->len) return o->rc->bytes[off];
+    return addr < o->rom->rom_size ? o->rom->rom_data[addr] : 0xFFu;
+}
+
+/* Can this instruction write a template byte the game does not rewrite (or
+ * anything that runs other chips)? Then the next instruction checks the
+ * template. False only when every write is provably elsewhere. */
+static bool ovl_may_write_template(const M68KInstr *in, const GameRamCode *rc) {
+    int ea, wi;
+    switch (in->mnemonic) {
+    case MN_Bcc: case MN_BRA: case MN_DBcc: case MN_RTE: case MN_RTS: case MN_JMP:
+    case MN_NOP: case MN_TST: case MN_CMP: case MN_CMPA: case MN_CMPI: case MN_BTST:
+    case MN_MOVEQ: case MN_LEA: case MN_MOVEA: case MN_EXT: case MN_SWAP:
+        return false;
+    case MN_MOVE:
+        ea = in->dst_ea;
+        wi = 1 + ea_ext_words_count((in->src_ea >> 3) & 7, in->src_ea & 7, in->size);
+        break;
+    case MN_ADDQ: case MN_SUBQ:
+        ea = in->src_ea;
+        wi = 1;
+        break;
+    default:
+        return true;
+    }
+    int mode = (ea >> 3) & 7, reg = ea & 7;
+    if (mode <= 1) return false;                    /* a register */
+    if (mode != 7 || reg > 1) return true;          /* through a register: anywhere */
+    for (int b = 0; b < (reg ? 4 : 2); b++) {       /* its address rewritten: anywhere */
+        uint32_t off = in->addr + 2u * (uint32_t)wi + (uint32_t)b - rc->addr;
+        if (off < rc->len && rc->live[off]) return true;
+    }
+    uint32_t a = reg == 0 ? (uint32_t)(int32_t)(int16_t)in->words[wi]
+                          : ((uint32_t)in->words[wi] << 16) | in->words[wi + 1];
+    a &= 0xFFFFFFu;
+    if (a >= 0xA00000u && a < 0xA20000u) return true;   /* Z80 / I/O: the Z80 may run */
+    if (a < 0xE00000u) return false;                     /* not work RAM */
+    for (int b = 0; b < size_bytes(in->size); b++) {
+        uint32_t off = ((a + (uint32_t)b) - rc->addr) & 0xFFFFu;
+        if (off < rc->len && !rc->live[off]) return true;
+    }
+    return false;
+}
+
+static bool emit_ram_code(FILE *f, const GenesisRom *rom, const GameRamCode *rc, int idx) {
+    OvlFetch of = { rom, rc };
+    GenesisRom view = *rom;
+    view.rom_size = 0x1000000u;
+    view.read8_override = ovl_fetch8;
+    view.read8_user = &of;
+
+    /* linear decode: every instruction start of the template */
+    AddrSet instrs;
+    addrset_init(&instrs);
+    for (uint32_t a = rc->addr; a < rc->addr + rc->len; ) {
+        M68KInstr in;
+        if (!m68k_decode(&view, a, &in) || in.byte_length == 0 ||
+            a + in.byte_length > rc->addr + rc->len) {
+            fprintf(stderr, "[ram_code] $%06X: template does not decode at $%06X "
+                    "(or its last instruction runs past the length)\n", rc->addr, a);
+            addrset_free(&instrs);
+            return false;
+        }
+        addrset_insert(&instrs, a);
+        a += in.byte_length;
+    }
+    addrset_sort(&instrs);
+
+    /* live words: one _lw slot each; a live opcode byte only as a Bcc.S displacement */
+    int nslots = 0, live_bcc = 0, sp_adjust = 0;
+    for (uint32_t k = 0; k < GAMECFG_RAM_CODE_MAX_LEN; k++) s_ovl_slot[k] = -1;
+    for (int j = 0; j < instrs.count; j++) {
+        M68KInstr in;
+        m68k_decode(&view, instrs.addrs[j], &in);
+        uint32_t off = in.addr - rc->addr;
+        if (insn_adjusts_sp(&in)) sp_adjust = 1;
+        if (rc->live[off] || (rc->live[off + 1] &&
+                              !(in.mnemonic == MN_Bcc && in.byte_length == 2))) {
+            fprintf(stderr, "[ram_code] $%06X: live opcode byte at $%06X is not a Bcc.S "
+                    "displacement (unsupported)\n", rc->addr, in.addr);
+            addrset_free(&instrs);
+            return false;
+        }
+        if (rc->live[off + 1]) live_bcc = 1;
+        for (uint32_t b = 2; b < in.byte_length; b += 2)
+            if (rc->live[off + b] || rc->live[off + b + 1])
+                s_ovl_slot[off + b] = nslots++;
+    }
+
+    fprintf(f, "/* RAM code at $%06X (game.toml [[ram_code]] #%d): %u bytes as %s */\n",
+            rc->addr, idx, rc->len, "copied there; runs when RAM holds them (runner/glue.c)");
+    fprintf(f, "void ramc_%02d_%06X(void) {\n", idx, rc->addr);
+    fprintf(f, "  int _chk = 0;  /* check the template at the next boundary */\n");
+    if (nslots) fprintf(f, "  uint16_t _lw[%d];  /* live operand words */\n", nslots);
+    if (live_bcc) fprintf(f, "  uint8_t _lb;  /* a live branch displacement */\n");
+    if (sp_adjust) {
+        fprintf(f, "  int _sp_popped = g_split_sp_popped;\n");
+        fprintf(f, "  g_split_sp_popped = 0;\n");
+    }
+
+    s_ovl = rc;
+    s_case_count = 0;
+    bool ok = true;
+    char fname[32];
+    snprintf(fname, sizeof fname, "ramc_%02d_%06X", idx, rc->addr);
+    for (int j = 0; j < instrs.count && ok; j++) {
+        uint32_t pc = instrs.addrs[j];
+        uint32_t off = pc - rc->addr;
+        M68KInstr in;
+        m68k_decode(&view, pc, &in);
+        int cost = estimate_cycles(&in);
+
+        fprintf(f, "  label_%06X:;\n", pc);
+        fprintf(f, "  /* $%06X */\n", pc);
+        fprintf(f, "  if (g_xclk >= g_xend) { x68k_slice(0x%06Xu); "
+                   "if (g_xabort) { g_xabort = 0; return; } _chk = 1; }\n", pc);
+        fprintf(f, "  if (_chk) { _chk = 0; if (!recomp_ram_code_matches(&g_recomp_ram_code[%d])) "
+                   "{ recomp_exact_ram_resume(0x%06Xu); return; } }\n", idx, pc);
+        bool bcc_live = in.mnemonic == MN_Bcc && in.byte_length == 2 && rc->live[off + 1];
+        if (bcc_live) {
+            /* the template's instruction starts a .S displacement can reach (not 0 / -1:
+             * those are other encodings) */
+            fprintf(f, "  _lb = g_ram[0x%04Xu];\n", (pc + 1u) & 0xFFFFu);
+            fprintf(f, "  switch (_lb) {\n");
+            for (int t = 0; t < instrs.count; t++) {
+                int32_t d = (int32_t)instrs.addrs[t] - (int32_t)(pc + 2u);
+                if (d >= -128 && d <= 127 && d != 0 && d != -1)
+                    fprintf(f, "  case 0x%02X:\n", (unsigned)(uint8_t)d);
+            }
+            fprintf(f, "    break;\n  default: recomp_exact_ram_resume(0x%06Xu); return;\n  }\n", pc);
+        }
+        for (uint32_t b = 2; b < in.byte_length; b += 2)
+            if (s_ovl_slot[off + b] >= 0)
+                fprintf(f, "  _lw[%d] = (uint16_t)((g_ram[0x%04Xu] << 8) | g_ram[0x%04Xu]);\n",
+                        s_ovl_slot[off + b], (pc + b) & 0xFFFFu, (pc + b + 1u) & 0xFFFFu);
+        fprintf(f, "  XI_CHARGE(0x%06Xu, %du);\n", pc, 7 * cost);
+        if (ovl_may_write_template(&in, rc))
+            fprintf(f, "  _chk = 1;\n");
+
+        if (bcc_live) {
+            int cond = (in.words[0] >> 8) & 0xF;
+            fprintf(f, "  if (%s) {\n    switch (_lb) {\n", bcc_cond_expr(cond));
+            for (int t = 0; t < instrs.count; t++) {
+                int32_t d = (int32_t)instrs.addrs[t] - (int32_t)(pc + 2u);
+                if (d >= -128 && d <= 127 && d != 0 && d != -1)
+                    fprintf(f, "    case 0x%02X: goto label_%06X;\n",
+                            (unsigned)(uint8_t)d, instrs.addrs[t]);
+            }
+            fprintf(f, "    }\n  }\n");
+            fprintf(f, "  XC(-14);  /* not taken: Bcc.S 8 (base 10 charged) */\n");
+            continue;
+        }
+
+        memset(s_ovl_used, 0, sizeof s_ovl_used);
+        bool skip = false;
+        int sp = sp_adjust;
+        emit_instr(f, &view, &in, &instrs, &skip, &sp, fname, rc->addr);
+        for (uint32_t b = 2; b < in.byte_length; b++)
+            if (rc->live[off + b] && !s_ovl_used[off + b]) {
+                fprintf(stderr, "[ram_code] $%06X: the live byte $%06X of the instruction at "
+                        "$%06X is not an absolute operand the emitter reads (unsupported)\n",
+                        rc->addr, pc + b, pc);
+                ok = false;
+            }
+    }
+    s_ovl = NULL;
+    /* past the template: whatever RAM holds there (another overlay, or the interpreter) */
+    fprintf(f, "  recomp_tail_call(0x%06Xu); return;\n}\n\n", rc->addr + rc->len);
+    addrset_free(&instrs);
+    return ok;
+}
+
 static void emit_decls_preamble(FILE *f) {
     fprintf(f, "#pragma once\n");
     fprintf(f, "/* <prefix>_decls.h — AUTO-GENERATED by GenesisRecomp. DO NOT EDIT.\n");
@@ -4792,35 +5075,9 @@ bool codegen_emit(const GenesisRom *rom, const FunctionList *funcs,
         int has_sp_adjust = 0;
         for (int j = 0; j < instrs.count; j++) {
             M68KInstr pre;
-            if (m68k_decode(rom, instrs.addrs[j], &pre)) {
-                if ((pre.mnemonic == MN_ADDQ || pre.mnemonic == MN_ADDA) &&
-                    ((pre.src_ea >> 3) & 7) == 1 && (pre.src_ea & 7) == 7 &&
-                    pre.size == M68K_SIZE_L && (pre.imm32 % 4) == 0 && pre.imm32 > 0) {
-                    has_sp_adjust = 1;
-                    break;
-                }
-                if (pre.size == M68K_SIZE_L
-                        && (pre.mnemonic == MN_MOVE || pre.mnemonic == MN_MOVEA)
-                        && pre.src_ea == ((EA_An_POST << 3) | 7)) {
-                    has_sp_adjust = 1;
-                    break;
-                }
-                if (pre.size == M68K_SIZE_L && pre.mnemonic == MN_MOVE
-                        && pre.dst_ea == ((EA_An_PRE << 3) | 7)) {
-                    has_sp_adjust = 1;
-                    break;
-                }
-                if (pre.size == M68K_SIZE_L && pre.mnemonic == MN_MOVEM) {
-                    int dir = (pre.words[0] >> 10) & 1;
-                    int mode = (pre.src_ea >> 3) & 7;
-                    int reg = pre.src_ea & 7;
-                    if (reg == 7
-                            && ((dir == 1 && mode == 3)
-                                || (dir == 0 && mode == 4))) {
-                        has_sp_adjust = 1;
-                        break;
-                    }
-                }
+            if (m68k_decode(rom, instrs.addrs[j], &pre) && insn_adjusts_sp(&pre)) {
+                has_sp_adjust = 1;
+                break;
             }
         }
         if (has_sp_adjust) {
@@ -5123,6 +5380,47 @@ bool codegen_emit(const GenesisRom *rom, const FunctionList *funcs,
         addrset_free(&labels);
     }
 
+    /* RAM code overlays: one buffered body (all overlays land in one part file). Timed exact
+     * mode only: anywhere else RAM code stays on the interpreter, as before. */
+    GameRamCode *ram_code = NULL;
+    int ram_code_count = 0;
+    if (cfg && cfg->ram_code_count && !s_timed)
+        printf("[Codegen] [[ram_code]]: %d overlays ignored (exact timing only)\n",
+               cfg->ram_code_count);
+    if (cfg && cfg->ram_code_count && s_timed) {
+        ram_code = (GameRamCode *)calloc((size_t)cfg->ram_code_count, sizeof *ram_code);
+        FILE *f_ram = tmpfile();
+        bool ram_ok = ram_code && f_ram;
+        for (int i = 0; ram_ok && i < cfg->ram_code_count; i++) {
+            ram_code[i] = cfg->ram_code[i];
+            GameRamCode *rc = &ram_code[i];
+            if (rc->has_source) {
+                if (rc->source + rc->len > rom->rom_size) {
+                    fprintf(stderr, "[ram_code] #%d: source $%06X+%u is past the ROM\n",
+                            i, rc->source, rc->len);
+                    ram_ok = false;
+                    break;
+                }
+                memcpy(rc->bytes, rom->rom_data + rc->source, rc->len);
+            }
+            ram_ok = emit_ram_code(f_ram, rom, rc, i);
+            ram_code_count++;
+        }
+        if (!ram_ok) {
+            fprintf(stderr, "codegen: [[ram_code]] generation failed\n");
+            if (f_ram) fclose(f_ram);
+            free(ram_code);
+            free(entry_owners);
+            addrset_free(&hard_boundaries);
+            addrset_free(&all_funcs);
+            part_buf_reset();
+            codegen_close_all(NULL, f_parts, GENESIS_SPLIT_PART_COUNT, f_dispatch);
+            return false;
+        }
+        part_buf_push(f_ram);
+        printf("[Codegen] [[ram_code]]: %d RAM code overlays generated\n", ram_code_count);
+    }
+
     /* Distribute the buffered function bodies across GENESIS_SPLIT_PART_COUNT
      * part files, greedily balanced by cumulative byte size: keep filling the
      * current part until it reaches total_size/N, then advance — clamped so
@@ -5212,6 +5510,28 @@ bool codegen_emit(const GenesisRom *rom, const FunctionList *funcs,
         "uint32_t game_dispatch_table_addr(int i) {\n"
         "    return (i >= 0 && i < %d) ? s_dispatch_table[i].addr : 0;\n"
         "}\n\n", dispatch_count);
+
+    /* RAM code overlays (game.toml [[ram_code]]): the runner's table (runner/glue.c). */
+    fprintf(f_dispatch, "/* RAM code overlays (game.toml [[ram_code]]) */\n");
+    for (int i = 0; i < ram_code_count; i++) {
+        const GameRamCode *rc = &ram_code[i];
+        fprintf(f_dispatch, "void ramc_%02d_%06X(void);\n", i, rc->addr);
+        for (int pass = 0; pass < 2; pass++) {
+            const uint8_t *v = pass ? rc->live : rc->bytes;
+            fprintf(f_dispatch, "static const uint8_t s_ramc_%02d_%s[%u] = {", i,
+                    pass ? "live" : "bytes", rc->len);
+            for (uint32_t k = 0; k < rc->len; k++)
+                fprintf(f_dispatch, "%s0x%02X", k ? "," : "", v[k]);
+            fprintf(f_dispatch, "};\n");
+        }
+    }
+    fprintf(f_dispatch, "const RecompRamCode g_recomp_ram_code[] = {\n");
+    for (int i = 0; i < ram_code_count; i++)
+        fprintf(f_dispatch, "    { 0x%06Xu, %uu, s_ramc_%02d_bytes, s_ramc_%02d_live, ramc_%02d_%06X },\n",
+                ram_code[i].addr, ram_code[i].len, i, i, i, ram_code[i].addr);
+    fprintf(f_dispatch, "    { 0u, 0u, NULL, NULL, NULL }\n};\n");
+    fprintf(f_dispatch, "const int g_recomp_ram_code_count = %d;\n\n", ram_code_count);
+    free(ram_code);
 
     /* game_hook sites, sorted, so the tier-3 interpreter can run the same
      * genesis_game_instruction_hook() callbacks as the generated code. */
