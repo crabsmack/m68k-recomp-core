@@ -5238,6 +5238,10 @@ bool codegen_emit(const GenesisRom *rom, const FunctionList *funcs,
              * address an interrupt pushes), then charges its exact cost. */
             if (s_timed)
                 fprintf(f_func, "  XI(0x%06Xu, %du);\n", pc, 7u * (unsigned)estimate_cycles(&instr));
+            /* Untimed: no boundary, but the instruction's pc for a coverage map
+             * (XU in the runtime: one byte per ROM word while a runner sets it). */
+            else if (s_exact)
+                fprintf(f_func, "  XU(0x%06Xu);\n", pc);
 
             /* Push-then-RTS: `move.l <ea>,-(sp)` or `pea <ea>` falling straight
              * into an RTS that no branch targets is a computed jump to the pushed
