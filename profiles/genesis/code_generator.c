@@ -4899,7 +4899,8 @@ bool codegen_emit(const GenesisRom *rom, const FunctionList *funcs,
             continue; /* emitted by the canonical host's shared body below */
         /* --skip: the function is supplied by other code (hand-written C behind a
          * func_ADDR slot entry). Declared in the header, never emitted; its interior
-         * labels get no entries, so a computed jump into it is a loud dispatch miss. */
+         * labels get entries only when the skip list names them too (supplied the same
+         * way), so a computed jump to any other label of it is a loud dispatch miss. */
         if (cfg && cfg->skip_count) {
             bool skip = false;
             for (int k = 0; k < cfg->skip_count && !skip; k++)
@@ -5348,9 +5349,17 @@ bool codegen_emit(const GenesisRom *rom, const FunctionList *funcs,
             else
                 fprintf(f_func, "void func_%06X(void) { func_body_%06X(0x%06Xu); }\n",
                         func_addr, func_addr, func_addr);
-            for (int k = lbl_first; k < s_lbl_count; k++)
-                fprintf(f_func, "void func_%06X(void) { func_body_%06X(0x%06Xu); }\n",
-                        s_lbl[k].label, func_addr, s_lbl[k].label);
+            /* A label entry is hooked like an alias: XENTRY counts game function starts only,
+             * so for a label it is just the per-game on_entry hook (an entry an external
+             * harness can intercept, e.g. a differential tester of replacement code). */
+            for (int k = lbl_first; k < s_lbl_count; k++) {
+                if (s_entry_hooks)
+                    fprintf(f_func, "void func_%06X(void) { if (XENTRY(0x%06Xu)) return; func_body_%06X(0x%06Xu); }\n",
+                            s_lbl[k].label, s_lbl[k].label, func_addr, s_lbl[k].label);
+                else
+                    fprintf(f_func, "void func_%06X(void) { func_body_%06X(0x%06Xu); }\n",
+                            s_lbl[k].label, func_addr, s_lbl[k].label);
+            }
             fprintf(f_func, "\n");
         }
 
@@ -5473,6 +5482,21 @@ bool codegen_emit(const GenesisRom *rom, const FunctionList *funcs,
     /* Forward-declare all functions */
     for (int i = 0; i < all_funcs.count; i++)
         fprintf(f_dispatch, "void func_%06X(void);\n", all_funcs.addrs[i]);
+    /* --skip of an address that is not a function start: an entry label of a skipped
+     * function, supplied (like the function) by other code. It keeps its dispatch entry, so
+     * a computed jump to it still lands in the replacement instead of missing. */
+    if (cfg && cfg->skip_count) {
+        for (int s = 0; s < cfg->skip_count; s++) {
+            uint32_t a = cfg->skip_addrs[s];
+            if (addr_is_function_entry(a, all_funcs.addrs, all_funcs.count))
+                continue;
+            bool dup = false;
+            for (int k = 0; k < s_lbl_count && !dup; k++)
+                dup = s_lbl[k].label == a;
+            if (!dup)
+                lbl_add(a, a);
+        }
+    }
     /* Exact mode: label entries (func_LABEL wrappers), merged in address order. */
     if (s_lbl_count)
         qsort(s_lbl, (size_t)s_lbl_count, sizeof *s_lbl, lbl_cmp);
