@@ -4381,7 +4381,7 @@ static bool insn_adjusts_sp(const M68KInstr *pre) {
 }
 
 /* =========================================================================
- * RAM code overlays (game.toml [[ram_code]], exact timing only)
+ * RAM code overlays (game.toml [[ram_code]], exact mode: timed or untimed)
  *
  * The exact interpreter runs RAM code as fetched: per instruction its
  * boundary (XI_BOUNDARY), the decode from live RAM, the exact cost
@@ -4396,6 +4396,10 @@ static bool insn_adjusts_sp(const M68KInstr *pre) {
  *     Bcc.S displacement checked against the template's instruction starts;
  *   - XI_CHARGE with the cost the interpreter charges (m68k_cycles_exact);
  *   - emit_instr's body, live absolute operands read from the loaded words.
+ * Untimed (--untimed, the frame-synchronous runners): the same blocks without
+ * the boundary and the cost (no clock: XU(pc) as every untimed instruction), so
+ * an interrupt handler in RAM (a per-line H-int raster) runs as generated
+ * code there too, not on the interpreter. The template check stays.
  * The runner enters it only when RAM holds the template (runner/glue.c). */
 typedef struct { const GenesisRom *rom; const GameRamCode *rc; } OvlFetch;
 static uint8_t ovl_fetch8(uint32_t addr, void *user) {
@@ -4516,8 +4520,9 @@ static bool emit_ram_code(FILE *f, const GenesisRom *rom, const GameRamCode *rc,
 
         fprintf(f, "  label_%06X:;\n", pc);
         fprintf(f, "  /* $%06X */\n", pc);
-        fprintf(f, "  if (g_xclk >= g_xend) { x68k_slice(0x%06Xu); "
-                   "if (g_xabort) { g_xabort = 0; return; } _chk = 1; }\n", pc);
+        if (s_timed)
+            fprintf(f, "  if (g_xclk >= g_xend) { x68k_slice(0x%06Xu); "
+                       "if (g_xabort) { g_xabort = 0; return; } _chk = 1; }\n", pc);
         fprintf(f, "  if (_chk) { _chk = 0; if (!recomp_ram_code_matches(&g_recomp_ram_code[%d])) "
                    "{ recomp_exact_ram_resume(0x%06Xu); return; } }\n", idx, pc);
         bool bcc_live = in.mnemonic == MN_Bcc && in.byte_length == 2 && rc->live[off + 1];
@@ -4537,7 +4542,8 @@ static bool emit_ram_code(FILE *f, const GenesisRom *rom, const GameRamCode *rc,
             if (s_ovl_slot[off + b] >= 0)
                 fprintf(f, "  _lw[%d] = (uint16_t)((g_ram[0x%04Xu] << 8) | g_ram[0x%04Xu]);\n",
                         s_ovl_slot[off + b], (pc + b) & 0xFFFFu, (pc + b + 1u) & 0xFFFFu);
-        fprintf(f, "  XI_CHARGE(0x%06Xu, %du);\n", pc, 7 * cost);
+        if (s_timed) fprintf(f, "  XI_CHARGE(0x%06Xu, %du);\n", pc, 7 * cost);
+        else         fprintf(f, "  XU(0x%06Xu);\n", pc);
         if (ovl_may_write_template(&in, rc))
             fprintf(f, "  _chk = 1;\n");
 
@@ -4551,7 +4557,7 @@ static bool emit_ram_code(FILE *f, const GenesisRom *rom, const GameRamCode *rc,
                             (unsigned)(uint8_t)d, instrs.addrs[t]);
             }
             fprintf(f, "    }\n  }\n");
-            fprintf(f, "  XC(-14);  /* not taken: Bcc.S 8 (base 10 charged) */\n");
+            if (s_timed) fprintf(f, "  XC(-14);  /* not taken: Bcc.S 8 (base 10 charged) */\n");
             continue;
         }
 
@@ -5393,14 +5399,14 @@ bool codegen_emit(const GenesisRom *rom, const FunctionList *funcs,
         addrset_free(&labels);
     }
 
-    /* RAM code overlays: one buffered body (all overlays land in one part file). Timed exact
-     * mode only: anywhere else RAM code stays on the interpreter, as before. */
+    /* RAM code overlays: one buffered body (all overlays land in one part file). Exact mode,
+     * timed or untimed: without exact mode RAM code stays on the interpreter, as before. */
     GameRamCode *ram_code = NULL;
     int ram_code_count = 0;
-    if (cfg && cfg->ram_code_count && !s_timed)
-        printf("[Codegen] [[ram_code]]: %d overlays ignored (exact timing only)\n",
+    if (cfg && cfg->ram_code_count && !s_exact)
+        printf("[Codegen] [[ram_code]]: %d overlays ignored (exact mode only)\n",
                cfg->ram_code_count);
-    if (cfg && cfg->ram_code_count && s_timed) {
+    if (cfg && cfg->ram_code_count && s_exact) {
         ram_code = (GameRamCode *)calloc((size_t)cfg->ram_code_count, sizeof *ram_code);
         FILE *f_ram = tmpfile();
         bool ram_ok = ram_code && f_ram;
